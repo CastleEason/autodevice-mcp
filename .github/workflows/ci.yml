@@ -23,7 +23,7 @@ jobs:
           - ubuntu-latest
     env:
       MOBILE_AUTO_MCP_PYTHON: python
-      MOBILE_AUTO_MCP_CACHE_HOME: ${{ runner.temp }}/autodevice-mcp-cache
+      MOBILE_AUTO_MCP_CACHE_HOME: ${{ github.workspace }}/.ci-cache/autodevice-mcp
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
