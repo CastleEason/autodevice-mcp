@@ -29,14 +29,14 @@ artifacts/
 .ruff_cache/
 
 .mobile_auto_mcp*/
-mobile-auto-mcp-data/
-data/
-logs/
-reports/
-screenshots/
-captures/
-tmp/
-temp/
+/mobile-auto-mcp-data/
+/data/
+/logs/
+/reports/
+/screenshots/
+/captures/
+/tmp/
+/temp/
 *.log
 *.jsonl
 *.har
