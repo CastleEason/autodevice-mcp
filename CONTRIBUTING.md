@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for improving `mobile-auto-mcp`.
+Thank you for improving `autodevice-mcp`.
 
 ## Before opening a change
 

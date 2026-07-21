@@ -1,6 +1,6 @@
 # Architecture
 
-`mobile-auto-mcp` is a local stdio MCP server. One process owns tool registration, case storage, device drivers, mitmproxy state, execution events, and report generation.
+`autodevice-mcp` is a local stdio MCP server. One process owns tool registration, case storage, device drivers, mitmproxy state, execution events, and report generation.
 
 ## Main components
 

@@ -877,6 +877,19 @@ def test_report_stop_delegates_exact_root_identity_and_keeps_failed_evidence(
     assert manager._read_state() == state
 
 
+def test_report_status_exposes_lan_urls_for_expanded_ipv6_unspecified_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat every unspecified IP spelling as an explicit all-interface report bind."""
+    manager = ReportServerManager(tmp_path, host="0:0:0:0:0:0:0:0", port=13080)
+    monkeypatch.setattr(report_server_module, "_lan_addresses", lambda: ["192.0.2.10"])
+
+    result = manager.status()
+
+    assert result["lan_urls"] == ["http://192.0.2.10:13080/"]
+
+
 def test_report_identity_mismatch_is_not_reported_stopped_and_preserves_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

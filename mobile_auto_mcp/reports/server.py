@@ -108,7 +108,9 @@ class ReportServerManager:
             "port": port,
             "report_root": str(self.report_root),
             "local_url": f"http://127.0.0.1:{port}/",
-            "lan_urls": [f"http://{address}:{port}/" for address in _lan_addresses()] if host in {"0.0.0.0", "::"} else [],
+            "lan_urls": [f"http://{address}:{port}/" for address in _lan_addresses()]
+            if _is_unspecified_bind(host)
+            else [],
             "log": str(self.log_path),
         }
 
@@ -321,3 +323,11 @@ def _lan_addresses() -> list[str]:
     except socket.gaierror:
         pass
     return sorted(addresses)
+
+
+def _is_unspecified_bind(host: str) -> bool:
+    """Return whether a numeric bind address intentionally listens on every interface."""
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False

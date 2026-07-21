@@ -11,8 +11,17 @@
     "postinstall": "node scripts/postinstall.js"
   },
   "files": [
-    "bin/", "lib/", "runtime/", "scripts/", "mobile_auto_mcp/", "pyproject.toml",
-    "README.md", "SECURITY.md", "LICENSE"
+    "bin/*.js",
+    "docs/*.md",
+    "lib/*.js",
+    "mobile_auto_mcp/**/*.py",
+    "runtime/*.json",
+    "runtime/*.txt",
+    "scripts/*.js",
+    "pyproject.toml",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
   ],
   "repository": { "type": "git", "url": "git+https://github.com/CastleEason/autodevice-mcp.git" },
   "bugs": { "url": "https://github.com/CastleEason/autodevice-mcp/issues" },

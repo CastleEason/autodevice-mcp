@@ -1,6 +1,12 @@
-# mobile-auto-mcp
+# autodevice-mcp
 
-`mobile-auto-mcp` is a local MCP server for repeatable abnormal API-response testing on Android, iOS, and HarmonyOS devices. It combines device automation, mitmproxy response mutation, evidence capture, cross-platform comparison, and auditable HTML/JSON reports behind one stdio MCP process.
+```bash
+npx -y autodevice-mcp --doctor
+```
+
+`autodevice-mcp` is a local MCP server for repeatable abnormal API-response testing on Android, iOS, and HarmonyOS devices. It combines device automation, mitmproxy response mutation, evidence capture, cross-platform comparison, and auditable HTML/JSON reports behind one stdio MCP process.
+
+The npm package bootstraps an isolated Python 3.12 runtime and keeps stdout reserved for MCP protocol frames. See [npm installation](docs/npm-installation.md) for cache, bootstrap, proxy, and troubleshooting details.
 
 ## Highlights
 
@@ -27,7 +33,8 @@ Do not run this project against devices, applications, or traffic you are not au
 
 ## Requirements
 
-- Python 3.12 or newer
+- Node.js 20 or newer
+- Python 3.12 when available; otherwise the npm launcher downloads its pinned managed Python 3.12 runtime
 - Android: `adb` and an authorized device
 - iOS: Xcode command-line tools, `iproxy`, and a prepared WebDriverAgent
 - HarmonyOS: `hdc` and an authorized device
@@ -35,38 +42,30 @@ Do not run this project against devices, applications, or traffic you are not au
 
 ## Installation
 
-Clone the repository, then install it in an isolated environment:
+No global install is required. Verify the launcher and runtime selection with:
 
 ```bash
-cd mobile-auto-mcp
-python3.12 -m venv .venv
-./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/python -m pip install -e .
+npx -y autodevice-mcp --doctor
 ```
 
-The package installs a `mobile-auto-mcp` console command. You can also run the module directly:
+To prebuild the isolated runtime without starting an MCP server:
 
 ```bash
-./.venv/bin/mobile-auto-mcp
-# or
-./.venv/bin/python -m mobile_auto_mcp.server
+npx -y autodevice-mcp --bootstrap-only
 ```
 
-Both commands use stdio transport and are intended to be started by an MCP client.
+The postinstall hook attempts the same bootstrap on a best-effort basis. A client launch retries it strictly and reports failures on stderr, never stdout.
 
 ## MCP client configuration
 
-Use absolute paths and a private writable data directory:
+Cursor configuration:
 
 ```json
 {
   "mcpServers": {
-    "mobile-auto-mcp": {
-      "command": "/absolute/path/mobile-auto-mcp/.venv/bin/python",
-      "args": ["-m", "mobile_auto_mcp.server"],
-      "env": {
-        "MOBILE_AUTO_MCP_HOME": "/absolute/private/path/mobile-auto-mcp-data"
-      }
+    "autodevice-mcp": {
+      "command": "npx",
+      "args": ["-y", "autodevice-mcp"]
     }
   }
 }
@@ -75,16 +74,15 @@ Use absolute paths and a private writable data directory:
 Codex TOML example:
 
 ```toml
-[mcp_servers.mobile_auto_mcp]
-command = "/absolute/path/mobile-auto-mcp/.venv/bin/python"
-args = ["-m", "mobile_auto_mcp.server"]
-startup_timeout_sec = 30
-
-[mcp_servers.mobile_auto_mcp.env]
-MOBILE_AUTO_MCP_HOME = "/absolute/private/path/mobile-auto-mcp-data"
+[mcp_servers.autodevice_mcp]
+command = "npx"
+args = ["-y", "autodevice-mcp"]
+startup_timeout_sec = 120
 ```
 
-Each operator should use a separate `MOBILE_AUTO_MCP_HOME`. It contains rules, navigation knowledge, sessions, proxy events, modified responses, screenshots, and reports.
+For stricter data isolation, set `MOBILE_AUTO_MCP_HOME` in the client environment to a private absolute directory. Each operator should use a separate location because it contains rules, navigation knowledge, sessions, proxy events, modified responses, screenshots, and reports.
+
+The bootstrap cache is separate from evidence: it defaults to `~/.cache/autodevice-mcp/<version>/<platform>` and can be moved with `MOBILE_AUTO_MCP_CACHE_HOME`. Do not point multiple untrusted users at one cache.
 
 `MOBILE_AUTO_MCP_MAX_RESPONSE_BYTES` controls the maximum serialized modified-response body retained per hit and defaults to 10 MiB. Explicit report output paths must remain inside the selected workspace data home.
 
@@ -98,6 +96,8 @@ Each operator should use a separate `MOBILE_AUTO_MCP_HOME`. It contains rules, n
 6. Provide `target_page` or explicit `target_page_assertions`; missing anchors are a hard block.
 7. Review `index.html`, `modified_responses.json`, and `manifest.json`, then submit final VLM or human decisions.
 8. Call `restore_retained_proxy` when capture is no longer needed.
+
+The proxy reminder is operationally important: a formal run deliberately retains the verified phone proxy and owned mitmproxy process for continued capture. Always call `restore_retained_proxy` before leaving the test network or returning a device.
 
 `proxy_host` is an optional preference, not a bypass. The address must be a current local candidate, satisfy every device's advertised Wi-Fi prefix, and pass a source-bound route probe to every selected phone. If any device address is unavailable or any route cannot be proven, readiness stops before changing the proxy.
 
@@ -124,7 +124,7 @@ The integrity gate prevents the HTML report from claiming success when execution
 
 Built-in Pillow comparison writes `visual_precheck` only. It never sets `passed` or `failed`. Successful execution returns `awaiting_review`; a Session becomes `reviewed` only after every lane has an explicit final pass.
 
-See [architecture](docs/architecture.md), [device setup](docs/device-setup.md), [report format](docs/report-format.md), [real-device regression](docs/real-device-regression.md), and [troubleshooting](docs/troubleshooting.md) for details.
+See [npm installation](docs/npm-installation.md), [architecture](docs/architecture.md), [device setup](docs/device-setup.md), [report format](docs/report-format.md), [real-device regression](docs/real-device-regression.md), and [troubleshooting](docs/troubleshooting.md) for details.
 
 ## Development and disclosure
 

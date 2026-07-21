@@ -1,6 +1,6 @@
 # Device Setup
 
-Use dedicated test devices and a network where the phones can route to the host running `mobile-auto-mcp`.
+Use dedicated test devices and a network where the phones can route to the host running `autodevice-mcp`.
 
 ## Android
 

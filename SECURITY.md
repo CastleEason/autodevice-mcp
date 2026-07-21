@@ -13,6 +13,9 @@ Include the affected version, platform, reproduction conditions, impact, and a m
 ## Operational security
 
 - Run only on devices and applications you are authorized to test.
+- Install the npm package from the public registry and verify its provenance. The release workflow uses npm Trusted Publishing with short-lived OIDC identity and does not require a long-lived npm publish token.
+- Keep the versioned runtime cache private. `MOBILE_AUTO_MCP_CACHE_HOME` contains executable Python environments; do not share it across untrusted operating-system users or restore it from unverified archives.
+- Managed Python archives are pinned by URL, byte length, and SHA-256 digest. Do not bypass TLS or checksum verification to work around a bootstrap failure.
 - Keep `MOBILE_AUTO_MCP_HOME` private; it contains execution and network evidence.
 - Runtime directories and evidence files are forced to owner-only permissions, but operators remain responsible for disk backups and host access.
 - Report servers bind to loopback by default. Binding to a LAN address is an explicit operator action and should be used only on a trusted network.

@@ -116,7 +116,7 @@ def _markdown_report(
 ) -> str:
     """生成包含证据完整性结论的 Markdown 执行摘要。"""
     lines = [
-        "# mobile_auto_mcp 执行报告",
+        "# autodevice-mcp 执行报告",
         "",
         f"- Session: `{session_id}`",
         f"- 记录数: {summary.get('records', 0)}",
@@ -176,7 +176,7 @@ def _html_report(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>mobile_auto_mcp 三端验收报告</title>
+  <title>autodevice-mcp 三端验收报告</title>
   <style>
     :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; --bg:#f4f6f8; --panel:#fff; --line:#d9e0e7; --text:#18212b; --muted:#667085; --pass:#087443; --fail:#b42318; --accent:#175cd3; }}
     * {{ box-sizing:border-box; }} body {{ margin:0; background:var(--bg); color:var(--text); font-size:14px; }}
@@ -578,7 +578,7 @@ def _write_report_hub(report_root: Path) -> Path:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>mobile_auto_mcp 报告中心</title>
+  <title>autodevice-mcp 报告中心</title>
   <style>
     :root {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; --bg:#f4f6f8; --panel:#fff; --line:#d9e0e7; --text:#18212b; --muted:#667085; --link:#175cd3; }}
     * {{ box-sizing:border-box; }} body {{ margin:0; background:var(--bg); color:var(--text); font-size:14px; }}

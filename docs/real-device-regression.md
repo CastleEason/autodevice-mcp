@@ -19,7 +19,7 @@ Create a private JSON file outside the repository. It must contain `run_cases` a
   "wda_url": "http://127.0.0.1:8100",
   "run_cases": {
     "app_id": "qa-sandbox",
-    "base_home": "/private/path/mobile-auto-mcp-data",
+    "base_home": "/private/path/autodevice-mcp-data",
     "case_file": "/private/path/test-cases.md",
     "target_page": "<generic-page-name>",
     "target_page_assertions": [{"any_text": ["<stable-page-anchor>"]}],
