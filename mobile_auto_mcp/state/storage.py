@@ -69,17 +69,20 @@ def _workspace_mutation(method: Any) -> Any:
                 finally:
                     held[path] = (descriptor, depth)
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-            if hasattr(os, "fchmod"):
-                # POSIX honors descriptor permissions; Windows relies on the private workspace boundary.
-                os.fchmod(descriptor, 0o600)
-            lock_file(descriptor)
-            held[path] = (descriptor, 1)
-            _TRANSACTION_LOCAL.held = held
             try:
-                return method(self, *args, **kwargs)
+                if hasattr(os, "fchmod"):
+                    # POSIX honors descriptor permissions; Windows relies on the private workspace boundary.
+                    os.fchmod(descriptor, 0o600)
+                lock_file(descriptor)
+                held[path] = (descriptor, 1)
+                _TRANSACTION_LOCAL.held = held
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    held.pop(path, None)
+                    unlock_file(descriptor)
             finally:
-                held.pop(path, None)
-                unlock_file(descriptor)
+                # Acquisition failures occur before the inner cleanup region, so descriptor ownership stays here.
                 os.close(descriptor)
 
     return guarded

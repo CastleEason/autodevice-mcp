@@ -45,7 +45,7 @@ def unlock_file(descriptor: int) -> None:
 
 
 def _lock_windows(descriptor: int, *, blocking: bool) -> None:
-    """Lock byte zero with msvcrt after ensuring an empty lock file has one byte."""
+    """Lock byte zero, retrying Windows contention indefinitely for blocking callers."""
     if _msvcrt is None:  # pragma: no cover - protected by the OS-specific import above.
         raise RuntimeError("Windows file-lock backend is unavailable")
     original_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
@@ -54,12 +54,20 @@ def _lock_windows(descriptor: int, *, blocking: bool) -> None:
             # msvcrt cannot lock beyond EOF, so reserve byte zero before the first acquisition.
             os.lseek(descriptor, 0, os.SEEK_SET)
             os.write(descriptor, b"\0")
-        os.lseek(descriptor, 0, os.SEEK_SET)
         mode = _msvcrt.LK_LOCK if blocking else _msvcrt.LK_NBLCK
-        try:
-            _msvcrt.locking(descriptor, mode, 1)
-        except OSError as exc:
-            _raise_nonblocking_contention(exc, blocking=blocking)
+        while True:
+            # Every retry repositions explicitly because msvcrt locks from the descriptor's current offset.
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                _msvcrt.locking(descriptor, mode, 1)
+                return
+            except OSError as exc:
+                if not _is_contention(exc):
+                    raise
+                if not blocking:
+                    raise BlockingIOError(exc.errno, exc.strerror) from exc
+                # LK_LOCK retries only for a bounded window internally; repeat until ownership is available.
+                continue
     finally:
         os.lseek(descriptor, original_offset, os.SEEK_SET)
 
@@ -78,6 +86,11 @@ def _unlock_windows(descriptor: int) -> None:
 
 def _raise_nonblocking_contention(exc: OSError, *, blocking: bool) -> None:
     """Normalize Windows/POSIX contention errno values for non-blocking callers."""
-    if not blocking and exc.errno in {errno.EACCES, errno.EDEADLK}:
+    if not blocking and _is_contention(exc):
         raise BlockingIOError(exc.errno, exc.strerror) from exc
     raise exc
+
+
+def _is_contention(exc: OSError) -> bool:
+    """Recognize errno values emitted when an advisory lock is already owned."""
+    return exc.errno in {errno.EACCES, errno.EDEADLK}

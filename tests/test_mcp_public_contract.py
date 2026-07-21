@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from mcp.server.fastmcp import FastMCP
 
+from mobile_auto_mcp.mcp_tools import registry
 from mobile_auto_mcp.mcp_tools import register_all_tools
+from mobile_auto_mcp.platform import capabilities
 
 
 def _tools() -> dict[str, Any]:
@@ -35,3 +38,22 @@ def test_visual_tool_describes_precheck_instead_of_final_verdict() -> None:
 
     assert "non-final" in description
     assert "precheck" in description
+
+
+def test_registered_device_status_stops_after_unsupported_ios_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return the registered tool's structured Windows blocker without constructing an iOS driver."""
+    monkeypatch.setattr(capabilities.platform, "system", lambda: "Windows")
+
+    def unexpected_driver(*args: object, **kwargs: object) -> object:
+        """Fail if the public MCP tool crosses its failed preflight gate into WDA-backed driver work."""
+        raise AssertionError(f"driver must not run after failed preflight: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(registry, "_make_driver", unexpected_driver)
+    result = _tools()["device_status"].fn(target="ios", auto_start_wda=True)
+
+    assert result["target"] == "ios"
+    assert result["preflight"]["ok"] is False
+    assert result["preflight"]["failures"][0]["code"] == "platform_not_supported"
+    assert result["current_app"] == {}

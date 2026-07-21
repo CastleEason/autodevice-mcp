@@ -240,6 +240,9 @@ def register_all_tools(mcp: Any) -> None:
             wda_start_command=wda_start_command,
             wda_iproxy_command=wda_iproxy_command,
         ).as_dict()
+        if not preflight_result.get("ok"):
+            # Readiness blockers are complete tool results; do not cross them into device/WDA construction.
+            return {"target": target, "preflight": preflight_result, "current_app": {}}
         return {"target": target, "preflight": preflight_result, "current_app": _make_driver(target, device_serial or android_serial, wda_url).current_app()}
 
     @mcp.tool()

@@ -19,14 +19,17 @@ def _knowledge_mutation(method: Any) -> Any:
     def guarded(self: "KnowledgeBase", *args: Any, **kwargs: Any) -> Any:
         """Execute a knowledge mutation while holding its advisory file lock."""
         descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        if hasattr(os, "fchmod"):
-            # POSIX honors descriptor permissions; Windows relies on the private knowledge directory.
-            os.fchmod(descriptor, 0o600)
-        lock_file(descriptor)
         try:
-            return method(self, *args, **kwargs)
+            if hasattr(os, "fchmod"):
+                # POSIX honors descriptor permissions; Windows relies on the private knowledge directory.
+                os.fchmod(descriptor, 0o600)
+            lock_file(descriptor)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                unlock_file(descriptor)
         finally:
-            unlock_file(descriptor)
+            # Keep descriptor cleanup active even when permission repair or lock acquisition raises.
             os.close(descriptor)
 
     return guarded

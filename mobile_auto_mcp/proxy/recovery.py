@@ -34,25 +34,38 @@ class WorkspaceRunLock:
             return self
         ensure_private_directory(self.path.parent)
         descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        if hasattr(os, "fchmod"):
-            # POSIX honors descriptor permissions; Windows relies on the private proxy directory.
-            os.fchmod(descriptor, 0o600)
+        acquired = False
         try:
+            if hasattr(os, "fchmod"):
+                # POSIX honors descriptor permissions; Windows relies on the private proxy directory.
+                os.fchmod(descriptor, 0o600)
             # Non-blocking acquisition prevents a second Runner from reaching preflight or shared proxy writes.
             lock_file(descriptor, blocking=False)
+            acquired = True
         except BlockingIOError as exc:
             os.close(descriptor)
             current_owner = self._read_owner()
             raise WorkspaceBusyError(
                 f"工作区正在被 {current_owner or '另一个任务'} 使用"
             ) from exc
-        metadata = json.dumps(
-            {"owner": self.owner, "pid": os.getpid(), "acquired_at": time.time()},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        os.ftruncate(descriptor, 0)
-        os.write(descriptor, metadata)
-        os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        try:
+            metadata = json.dumps(
+                {"owner": self.owner, "pid": os.getpid(), "acquired_at": time.time()},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, metadata)
+            os.fsync(descriptor)
+        except BaseException:
+            try:
+                if acquired:
+                    unlock_file(descriptor)
+            finally:
+                os.close(descriptor)
+            raise
         self._descriptor = descriptor
         return self
 
