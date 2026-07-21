@@ -6,11 +6,11 @@ const os = require("node:os");
 const path = require("node:path");
 const { assertSafeArchiveEntries, extractArchive } = require("../../lib/archive");
 
-function assetFor(content) {
+function assetFor(content, archiveType = "tar.gz") {
   return {
     sha256: crypto.createHash("sha256").update(content).digest("hex"),
     bytes: content.length,
-    archiveType: "tar.gz",
+    archiveType,
   };
 }
 
@@ -125,6 +125,37 @@ test("lists and validates tar entries before extracting with argument arrays", a
   });
 });
 
+test("keeps metacharacter-bearing zip paths out of PowerShell command arguments", async () => {
+  await withTempDirectory(async (directory) => {
+    const dangerousParent = path.join(directory, "zip';$(Invoke-Evil)&");
+    const archivePath = path.join(dangerousParent, "runtime';Write-Output PWN;.zip");
+    const destination = path.join(dangerousParent, "runtime&$(Invoke-Evil)");
+    const content = Buffer.from("zip-under-test");
+    const calls = [];
+    await fs.mkdir(dangerousParent);
+    await fs.writeFile(archivePath, content, { mode: 0o600 });
+
+    await extractArchive(assetFor(content, "zip"), archivePath, destination, {
+      runFile: async (command, args, options) => {
+        calls.push({ command, args, options });
+        return { stdout: args.some((value) => value.includes("OpenRead")) ? "[]" : "" };
+      },
+    });
+
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      const commandPosition = call.args.indexOf("-Command");
+      assert.equal(call.command, "powershell.exe");
+      assert.equal(commandPosition, call.args.length - 2);
+      assert.equal(call.args.length, commandPosition + 2);
+      assert.ok(!call.args.some((value) => value.includes(dangerousParent)));
+      assert.ok(call.options?.env?.AUTODEVICE_ARCHIVE_PATH.includes(dangerousParent));
+    }
+    assert.ok(calls[1].options.env.AUTODEVICE_DESTINATION_PATH.includes(dangerousParent));
+    assert.ok((await fs.stat(destination)).isDirectory());
+  });
+});
+
 test("does not invoke extraction after an unsafe listed entry", async () => {
   await withTempDirectory(async (directory) => {
     const content = Buffer.from("archive-under-test");
@@ -211,6 +242,58 @@ test("allows a temp path behind root-owned system symlink ancestors", async () =
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
+});
+
+test("rejects a root-owned symlink facade whose target is writable", async () => {
+  if (process.getuid?.() === 0) return;
+  await withTempDirectory(async (directory) => {
+    const content = Buffer.from("archive-under-test");
+    const archivePath = path.join(directory, "runtime.tar.gz");
+    const outside = path.join(directory, "writable-target");
+    const linkedParent = path.join(directory, "root-owned-facade");
+    const destination = path.join(linkedParent, "runtime");
+    await fs.writeFile(archivePath, content, { mode: 0o600 });
+    await fs.mkdir(outside);
+    await fs.chmod(outside, 0o777);
+    await fs.symlink(outside, linkedParent, "dir");
+
+    const fileSystem = {
+      ...fs,
+      lstat: async (value) => {
+        const info = await fs.lstat(value);
+        if (value !== linkedParent) return info;
+        return new Proxy(info, {
+          get(target, property) {
+            if (property === "uid") return 0;
+            const result = Reflect.get(target, property, target);
+            return typeof result === "function" ? result.bind(target) : result;
+          },
+        });
+      },
+      stat: async (value) => {
+        const info = await fs.stat(value);
+        if (value !== linkedParent) return info;
+        return new Proxy(info, {
+          get(target, property) {
+            if (property === "uid") return 0;
+            if (property === "mode") return target.mode | 0o022;
+            const result = Reflect.get(target, property, target);
+            return typeof result === "function" ? result.bind(target) : result;
+          },
+        });
+      },
+    };
+
+    await assert.rejects(
+      () => extractArchive(assetFor(content), archivePath, destination, {
+        fs: fileSystem,
+        listEntries: async () => ["python/"],
+        extract: async () => {},
+      }),
+      { code: "runtime_extract_failed" },
+    );
+    assert.deepEqual(await fs.readdir(outside), []);
+  });
 });
 
 test("lists and extracts the same immutable private archive copy", async () => {
