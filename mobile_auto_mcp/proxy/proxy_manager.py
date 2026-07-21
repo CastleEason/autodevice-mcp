@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from mobile_auto_mcp.platform.processes import (
     inspect_process,
     popen_session_kwargs,
     terminate_owned_process,
+    trusted_python_executables,
 )
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
@@ -339,23 +341,12 @@ def _stable_proxy_identity_fields(
     if inspection.status != "found":
         return None
     command = inspection.command
-    required_arguments = ("-s", str(addon_path.resolve()))
-    direct = ProcessIdentity("mitmdump", required_arguments)
-    if direct.matches(command):
-        return {
-            "process_executable": command[0],
-            "process_program": command[0],
-        }
-    if len(command) > 1:
-        launched = ProcessIdentity(
-            "mitmdump",
-            required_arguments,
-            launcher_executables=(command[0],),
-        )
-        if launched.matches(command):
+    for trusted in _trusted_proxy_identities(addon_path):
+        if trusted.matches(command):
+            launched = bool(trusted.launcher_executables)
             return {
                 "process_executable": command[0],
-                "process_program": command[1],
+                "process_program": command[1] if launched else command[0],
             }
     return None
 
@@ -368,13 +359,51 @@ def _proxy_identity_for_inspection(
     """Use persisted stable identity or safely derive legacy identity from exact live invariant args."""
     if inspection.status != "found":
         return None
-    persisted = _proxy_identity(addon_path, runtime)
-    if persisted.matches(inspection.command):
-        return persisted
     if runtime.get("process_executable") or runtime.get("process_program"):
-        return None
-    stable_fields = _stable_proxy_identity_fields(addon_path, inspection)
-    if stable_fields is None:
-        return None
-    derived = _proxy_identity(addon_path, stable_fields)
-    return derived if derived.matches(inspection.command) else None
+        persisted = _proxy_identity(addon_path, runtime)
+        return persisted if persisted.matches(inspection.command) else None
+    return next(
+        (
+            trusted
+            for trusted in _trusted_proxy_identities(addon_path)
+            if trusted.matches(inspection.command)
+        ),
+        None,
+    )
+
+
+def _trusted_proxy_identities(addon_path: Path) -> tuple[ProcessIdentity, ...]:
+    """Build proxy identities only from configured Python and installed mitmdump paths."""
+    required_arguments = ("-s", str(addon_path.resolve()))
+    launchers = trusted_python_executables(sys.executable)
+    identities: list[ProcessIdentity] = []
+    for program in _trusted_mitmdump_programs():
+        identities.append(ProcessIdentity(program, required_arguments))
+        identities.extend(
+            ProcessIdentity(program, required_arguments, launcher_executables=(launcher,))
+            for launcher in launchers
+        )
+    return tuple(identities)
+
+
+def _trusted_mitmdump_programs() -> tuple[str, ...]:
+    """Return installed mitmdump paths derived from PATH and trusted Python installations."""
+    candidates: list[str] = []
+
+    def add_installed(raw_path: str | None) -> None:
+        """Add one absolute installed program path and its canonical target without duplicates."""
+        if not raw_path:
+            return
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute() or not path.is_file():
+            return
+        for candidate in (path, path.resolve()):
+            value = str(candidate)
+            if value not in candidates:
+                candidates.append(value)
+
+    add_installed(shutil.which("mitmdump"))
+    for interpreter in trusted_python_executables(sys.executable):
+        for name in ("mitmdump", "mitmdump.exe"):
+            add_installed(str(Path(interpreter).parent / name))
+    return tuple(candidates)

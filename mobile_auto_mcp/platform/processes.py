@@ -11,6 +11,7 @@ import shlex
 import signal
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +76,48 @@ def popen_session_kwargs(system: str | None = None) -> dict[str, object]:
     if host_platform in {"Darwin", "Linux"}:
         return {"start_new_session": True}
     raise ValueError(f"unsupported host platform: {host_platform}")
+
+
+def trusted_python_executables(
+    configured_executable: str | None = None,
+    system: str | None = None,
+) -> tuple[str, ...]:
+    """Return installed Python paths derived only from trusted interpreter configuration."""
+    host_platform = system or platform.system()
+    candidates: list[str] = []
+
+    def add_installed(raw_path: str) -> None:
+        """Add one absolute installed path and its canonical target without duplicates."""
+        if not raw_path:
+            return
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute() or not path.is_file():
+            return
+        for candidate in (path, path.resolve()):
+            value = str(candidate)
+            normalized = _normalized_token(value, host_platform)
+            if all(_normalized_token(existing, host_platform) != normalized for existing in candidates):
+                candidates.append(value)
+
+    for executable in (
+        configured_executable or "",
+        sys.executable,
+        str(getattr(sys, "_base_executable", "") or ""),
+    ):
+        add_installed(executable)
+
+    if host_platform == "Darwin":
+        for executable in tuple(candidates):
+            path = Path(executable)
+            version_root = next(
+                (ancestor for ancestor in path.parents if ancestor.parent.name == "Versions"),
+                None,
+            )
+            if version_root is not None:
+                add_installed(
+                    str(version_root / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python")
+                )
+    return tuple(candidates)
 
 
 def inspect_process(

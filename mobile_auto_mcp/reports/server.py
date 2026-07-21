@@ -17,6 +17,7 @@ from mobile_auto_mcp.platform.processes import (
     inspect_process,
     popen_session_kwargs,
     terminate_owned_process,
+    trusted_python_executables,
 )
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
@@ -69,13 +70,13 @@ class ReportServerManager:
             if self._port_ready():
                 inspection = inspect_process(process.pid)
                 if inspection.status == "found":
-                    stable_identity = _report_process_identity(
+                    stable_identity = _trusted_report_identity_for_command(
                         self.report_root,
                         self.host,
                         self.port,
-                        executable=inspection.command[0],
+                        inspection.command,
                     )
-                    if stable_identity.matches(inspection.command):
+                    if stable_identity is not None:
                         state["process_executable"] = inspection.command[0]
                         self._write_state(state)
                         return {"ok": True, "already_running": False, **self.status()}
@@ -278,18 +279,34 @@ def _report_process_identity_for_inspection(
     """Use persisted stable identity or safely derive legacy identity from exact live invariant args."""
     if inspection.status != "found":
         return None
-    persisted = _report_process_identity_from_state(report_root, host, port, state)
-    if persisted.matches(inspection.command):
-        return persisted
     if state.get("process_executable"):
-        return None
-    derived = _report_process_identity(
+        persisted = _report_process_identity_from_state(report_root, host, port, state)
+        return persisted if persisted.matches(inspection.command) else None
+    return _trusted_report_identity_for_command(
         report_root,
         host,
         port,
-        executable=inspection.command[0],
+        inspection.command,
     )
-    return derived if derived.matches(inspection.command) else None
+
+
+def _trusted_report_identity_for_command(
+    report_root: Path,
+    host: str,
+    port: int,
+    command: tuple[str, ...] | list[str],
+) -> ProcessIdentity | None:
+    """Match report argv only against configured Python and derived installed native launch paths."""
+    for executable in trusted_python_executables(sys.executable):
+        identity = _report_process_identity(
+            report_root,
+            host,
+            port,
+            executable=executable,
+        )
+        if identity.matches(command):
+            return identity
+    return None
 
 
 def _lan_addresses() -> list[str]:

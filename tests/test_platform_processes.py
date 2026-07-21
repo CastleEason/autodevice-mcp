@@ -727,6 +727,46 @@ def test_real_proxy_stops_legacy_state_after_framework_reexec(tmp_path: Path) ->
                 handle.close()
 
 
+def test_legacy_proxy_never_authorizes_echo_from_observed_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject PID reuse by echo even when it contains mitmdump and the exact addon arguments."""
+    manager = ProxyManager(tmp_path, target="android", port=13000)
+    legacy = {
+        "pid": 4242,
+        "port": manager.port,
+        "home": str(tmp_path.resolve()),
+        "addon": str(manager.addon_path.resolve()),
+    }
+    manager.runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.runtime_path.write_text(json.dumps(legacy), encoding="utf-8")
+    observed = (
+        "/bin/echo",
+        "mitmdump",
+        "-s",
+        str(manager.addon_path.resolve()),
+    )
+    delegated: list[int] = []
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "inspect_process",
+        lambda pid: ProcessInspection(status="found", command=observed),
+    )
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "terminate_owned_process",
+        lambda pid, identity, *, process_group: delegated.append(pid) or {"ok": True},
+    )
+
+    result = manager.stop_owned_retained(legacy)
+
+    assert result["ok"] is False
+    assert result["status"] == "ownership_mismatch"
+    assert delegated == []
+    assert manager.runtime_path.exists()
+
+
 def test_proxy_retained_stop_delegates_exact_addon_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -739,13 +779,19 @@ def test_proxy_retained_stop_delegates_exact_addon_identity(
         "home": str(tmp_path.resolve()),
         "addon": str(manager.addon_path.resolve()),
     }
-    command = ("mitmdump", "-s", str(manager.addon_path.resolve()))
+    trusted_program = "/trusted/bin/mitmdump"
+    command = (trusted_program, "-s", str(manager.addon_path.resolve()))
     delegated: list[tuple[int, ProcessIdentity, bool]] = []
     monkeypatch.setattr(
         proxy_manager_module,
         "inspect_process",
         lambda pid: ProcessInspection(status="found", command=command),
         raising=False,
+    )
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "_trusted_mitmdump_programs",
+        lambda: (trusted_program,),
     )
     monkeypatch.setattr(
         proxy_manager_module,
@@ -761,9 +807,8 @@ def test_proxy_retained_stop_delegates_exact_addon_identity(
         (
             4242,
             ProcessIdentity(
-                "mitmdump",
+                trusted_program,
                 ("-s", str(manager.addon_path.resolve())),
-                launcher_executables=(Path(sys.executable).name,),
             ),
             False,
         ),
@@ -813,9 +858,9 @@ def test_report_stop_delegates_exact_root_identity_and_keeps_failed_evidence(
     assert result["stopped"] is False
     assert delegated == [
         (
-            4242,
-            ProcessIdentity(
-                Path(sys.executable).name,
+                4242,
+                ProcessIdentity(
+                    sys.executable,
                 (
                     "-m",
                     "http.server",
@@ -859,6 +904,50 @@ def test_report_identity_mismatch_is_not_reported_stopped_and_preserves_state(
     assert result["stopped"] is False
     assert result["ownership_verified"] is False
     assert manager._read_state() == state
+
+
+def test_legacy_report_never_authorizes_echo_from_observed_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject PID reuse by echo even when it contains the exact persisted report-server arguments."""
+    manager = ReportServerManager(tmp_path, port=13080)
+    legacy = {
+        "pid": 4242,
+        "host": manager.host,
+        "port": manager.port,
+        "report_root": str(manager.report_root),
+    }
+    manager._write_state(legacy)
+    observed = (
+        "/bin/echo",
+        "-m",
+        "http.server",
+        "13080",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        str(manager.report_root),
+    )
+    delegated: list[int] = []
+    monkeypatch.setattr(
+        report_server_module,
+        "inspect_process",
+        lambda pid: ProcessInspection(status="found", command=observed),
+    )
+    monkeypatch.setattr(
+        report_server_module,
+        "terminate_owned_process",
+        lambda pid, identity, *, process_group: delegated.append(pid) or {"ok": True},
+    )
+
+    result = manager.stop()
+
+    assert result["ok"] is False
+    assert result["stopped"] is False
+    assert result["ownership_verified"] is False
+    assert delegated == []
+    assert manager.state_path.exists()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework-Python re-exec integration")
