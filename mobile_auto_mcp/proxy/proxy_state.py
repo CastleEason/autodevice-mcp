@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +14,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
+from mobile_auto_mcp.platform.file_lock import lock_file, unlock_file
 from mobile_auto_mcp.state.private_files import append_private_text, atomic_write_private_text, ensure_private_directory
 
 
@@ -308,11 +308,11 @@ class ProxyState:
         ensure_private_directory(self.lock_path.parent)
         with self.lock_path.open("a+", encoding="utf-8") as handle:
             self.lock_path.chmod(0o600)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            lock_file(handle.fileno())
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                unlock_file(handle.fileno())
 
 
 def _normalize_lanes(lanes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:

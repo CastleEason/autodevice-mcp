@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
@@ -10,6 +9,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from mobile_auto_mcp.platform.file_lock import lock_file, unlock_file
 from mobile_auto_mcp.proxy.device_proxy import ProxySnapshot
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
@@ -34,10 +34,12 @@ class WorkspaceRunLock:
             return self
         ensure_private_directory(self.path.parent)
         descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            # POSIX honors descriptor permissions; Windows relies on the private proxy directory.
+            os.fchmod(descriptor, 0o600)
         try:
             # Non-blocking acquisition prevents a second Runner from reaching preflight or shared proxy writes.
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(descriptor, blocking=False)
         except BlockingIOError as exc:
             os.close(descriptor)
             current_owner = self._read_owner()
@@ -61,7 +63,7 @@ class WorkspaceRunLock:
             return
         self._descriptor = None
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            unlock_file(descriptor)
         finally:
             os.close(descriptor)
 

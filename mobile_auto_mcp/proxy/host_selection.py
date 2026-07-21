@@ -8,6 +8,8 @@ import subprocess
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from mobile_auto_mcp.platform.network import ping_command
+
 
 _INET_PATTERN = re.compile(
     r"\binet(?:\s+addr:|\s+)(?P<address>\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)\b",
@@ -150,7 +152,7 @@ def probe_proxy_host_reachability(
         if destination is None:
             evidence.append({"target": target, "device_ip": str(value), "reachable": False, "reason": "invalid_device_ip"})
             continue
-        command = ["/sbin/ping", "-S", str(source), "-c", "1", "-W", "1000", str(destination)]
+        command = ping_command(str(source), str(destination))
         try:
             completed = command_runner(command) if command_runner else subprocess.run(
                 command,

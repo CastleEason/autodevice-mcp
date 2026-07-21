@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import fcntl
 import os
 from pathlib import Path
 from functools import wraps
 from typing import Any
 
+from mobile_auto_mcp.platform.file_lock import lock_file, unlock_file
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
 
@@ -19,12 +19,14 @@ def _knowledge_mutation(method: Any) -> Any:
     def guarded(self: "KnowledgeBase", *args: Any, **kwargs: Any) -> Any:
         """Execute a knowledge mutation while holding its advisory file lock."""
         descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if hasattr(os, "fchmod"):
+            # POSIX honors descriptor permissions; Windows relies on the private knowledge directory.
+            os.fchmod(descriptor, 0o600)
+        lock_file(descriptor)
         try:
             return method(self, *args, **kwargs)
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            unlock_file(descriptor)
             os.close(descriptor)
 
     return guarded

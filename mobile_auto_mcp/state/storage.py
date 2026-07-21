@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import fcntl
 import threading
 from datetime import datetime
 from functools import wraps
@@ -13,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from mobile_auto_mcp.proxy.proxy_state import ProxyState
+from mobile_auto_mcp.platform.file_lock import lock_file, unlock_file
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
 
@@ -69,15 +69,17 @@ def _workspace_mutation(method: Any) -> Any:
                 finally:
                     held[path] = (descriptor, depth)
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if hasattr(os, "fchmod"):
+                # POSIX honors descriptor permissions; Windows relies on the private workspace boundary.
+                os.fchmod(descriptor, 0o600)
+            lock_file(descriptor)
             held[path] = (descriptor, 1)
             _TRANSACTION_LOCAL.held = held
             try:
                 return method(self, *args, **kwargs)
             finally:
                 held.pop(path, None)
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                unlock_file(descriptor)
                 os.close(descriptor)
 
     return guarded

@@ -8,13 +8,13 @@ import subprocess
 from dataclasses import dataclass, asdict
 from typing import Any
 
-from mobile_auto_mcp.execution.devices import DEFAULT_WDA_URL, IOSWDAClient, SUPPORTED_TARGETS, WDAConnectionError
 from mobile_auto_mcp.execution.failures import build_failure
-from mobile_auto_mcp.execution.wda_guardian import ensure_wda, resolve_iproxy_command, resolve_wda_start_command, wda_setup_hint
+from mobile_auto_mcp.platform.capabilities import host_capability
 from mobile_auto_mcp.proxy.proxy_manager import DEFAULT_PORTS
 
 
 _LAST_HDC_DISCOVERY: dict[str, Any] = {}
+_SUPPORTED_TARGETS = {"android", "ios", "harmony"}
 
 
 @dataclass
@@ -52,13 +52,46 @@ def run_preflight(
     """Run preflight without mutating the phone proxy settings."""
     normalized = target.lower()
     expected_port = int(proxy_port or DEFAULT_PORTS.get(normalized, 12999))
+    capability = host_capability(normalized)
+    if not capability["ok"]:
+        # Unsupported iOS hosts stop before any WDA probe/start while other MCP lanes remain usable.
+        blocker = (
+            "platform_not_supported: iOS 自动化仅支持 macOS；"
+            f"当前主机平台为 {capability['host_platform']}"
+        )
+        checks = {
+            "host_capability": capability,
+            "expected_proxy_port": expected_port,
+            "device_driver_supported": normalized in _SUPPORTED_TARGETS,
+        }
+        proxy_instruction = build_proxy_instruction(normalized, expected_port, proxy_required)
+        return PreflightResult(
+            ok=False,
+            target=normalized,
+            proxy_required=proxy_required,
+            expected_proxy_port=expected_port,
+            checks=checks,
+            blockers=[blocker],
+            warnings=[],
+            failures=[
+                build_failure(
+                    "platform_not_supported",
+                    normalized,
+                    "preflight",
+                    evidence={"message": blocker, "checks": checks},
+                )
+            ],
+            phone_proxy_hint=proxy_instruction["message"],
+            proxy_instruction=proxy_instruction,
+        )
     checks: dict[str, Any] = {
+        "host_capability": capability,
         "mitmdump": bool(shutil.which("mitmdump")),
         "adb": bool(shutil.which("adb")),
         "hdc": bool(shutil.which("hdc")),
         "expected_proxy_port": expected_port,
         "proxy_port_free": _port_free(expected_port),
-        "device_driver_supported": normalized in SUPPORTED_TARGETS,
+        "device_driver_supported": normalized in _SUPPORTED_TARGETS,
     }
     blockers: list[str] = []
     warnings: list[str] = []
@@ -82,6 +115,15 @@ def run_preflight(
                 if not ok:
                     blockers.append(message)
     elif normalized == "ios":
+        # WDA modules stay behind the macOS capability gate so unsupported hosts can start the MCP.
+        from mobile_auto_mcp.execution.adapters.ios import DEFAULT_WDA_URL
+        from mobile_auto_mcp.execution.wda_guardian import (
+            ensure_wda,
+            resolve_iproxy_command,
+            resolve_wda_start_command,
+            wda_setup_hint,
+        )
+
         checks["wda_url"] = wda_url or DEFAULT_WDA_URL
         checks["wda"] = _wda_status(checks["wda_url"])
         checks["wda"]["auto_start_requested"] = bool(auto_start_wda)
@@ -324,7 +366,9 @@ def _local_ip_candidates() -> list[str]:
 
 
 def _wda_status(wda_url: str) -> dict[str, Any]:
-    """Handle wda status using the supplied state and inputs."""
+    """Probe WDA lazily after the host capability gate accepts the iOS lane."""
+    from mobile_auto_mcp.execution.adapters.ios import IOSWDAClient, WDAConnectionError
+
     try:
         return {"ok": True, "status": IOSWDAClient(wda_url).status()}
     except WDAConnectionError as exc:
