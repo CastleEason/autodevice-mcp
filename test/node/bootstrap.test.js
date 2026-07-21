@@ -594,7 +594,7 @@ test("an unusable system Python falls back to the managed Python runtime", async
 
     assert.equal(state.downloads, 1);
     assert.equal(state.installs, 1);
-    assert.match(runtime.python, new RegExp(`${path.sep}managed${path.sep}`));
+    assert.ok(runtime.python.includes(`${path.sep}managed${path.sep}`));
     assert.equal(runtime.manifest.pythonVersion, "3.12.13");
     assert.ok(state.logs.some((message) => message.includes("managed Python")));
   });

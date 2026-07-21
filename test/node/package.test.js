@@ -33,7 +33,7 @@ async function packInto(destination) {
   const { stdout } = await execFileAsync(
     npmCommand,
     ["pack", "--json", "--ignore-scripts", "--pack-destination", destination],
-    { cwd: packageRoot, encoding: "utf8" },
+    { cwd: packageRoot, encoding: "utf8", shell: process.platform === "win32" },
   );
   const result = JSON.parse(stdout);
   assert.equal(result.length, 1, stdout);

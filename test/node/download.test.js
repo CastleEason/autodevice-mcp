@@ -46,7 +46,7 @@ function fileSystemWithWrappedWrites(wrapWrite) {
   };
 }
 
-test("streams a verified artifact into a mode 0600 destination", async () => {
+test("streams a verified artifact into a private destination", async () => {
   await withTempFile(async (file) => {
     const content = Buffer.from("verified-runtime");
     const asset = assetFor(content);
@@ -57,7 +57,9 @@ test("streams a verified artifact into a mode 0600 destination", async () => {
     });
 
     assert.deepEqual(await fs.readFile(file), content);
-    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    }
     assert.deepEqual(await fs.readdir(path.dirname(file)), [path.basename(file)]);
   });
 });

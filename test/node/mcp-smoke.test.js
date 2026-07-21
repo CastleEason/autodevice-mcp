@@ -100,7 +100,7 @@ test("installed npm tarball starts with an MCP initialize response on stdout", {
     const { stdout } = await execFileAsync(
       npmCommand,
       ["pack", "--json", "--ignore-scripts", "--pack-destination", packDirectory],
-      { cwd: packageRoot, encoding: "utf8" },
+      { cwd: packageRoot, encoding: "utf8", shell: process.platform === "win32" },
     );
     const [{ filename }] = JSON.parse(stdout);
     const tarball = path.join(packDirectory, filename);
@@ -113,12 +113,18 @@ test("installed npm tarball starts with an MCP initialize response on stdout", {
       ...(process.env.SSL_CERT_FILE || !certificateBundle ? {} : { SSL_CERT_FILE: certificateBundle }),
     };
 
-    await execFileAsync(npmCommand, ["init", "-y"], { cwd: projectDirectory, env, encoding: "utf8" });
+    await execFileAsync(npmCommand, ["init", "-y"], {
+      cwd: projectDirectory,
+      env,
+      encoding: "utf8",
+      shell: process.platform === "win32",
+    });
     await execFileAsync(npmCommand, ["install", tarball], {
       cwd: projectDirectory,
       env,
       encoding: "utf8",
       timeout: 180_000,
+      shell: process.platform === "win32",
     });
 
     const executable = process.platform === "win32"

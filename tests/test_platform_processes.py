@@ -528,6 +528,14 @@ def test_managed_servers_start_in_an_independent_process_group(
                 ),
             ),
         )
+        monkeypatch.setattr(
+            proxy_manager_module,
+            "_stable_proxy_identity_fields",
+            lambda addon_path, inspection: {
+                "process_executable": inspection.command[0],
+                "process_program": inspection.command[1],
+            },
+        )
         try:
             result = manager.start()
         finally:
@@ -557,11 +565,22 @@ def test_managed_servers_start_in_an_independent_process_group(
                 ),
             ),
         )
+        monkeypatch.setattr(
+            report_server_module,
+            "_trusted_report_identity_for_command",
+            lambda report_root, host, port, command: ProcessIdentity(
+                command[0],
+                ("-m", "http.server", str(port), "--bind", host, "--directory", str(report_root)),
+            ),
+        )
         result = manager.start()
 
     assert result["ok"] is True
     assert len(popen_calls) == 1
-    assert popen_calls[0]["start_new_session"] is True
+    if sys.platform == "win32":
+        assert popen_calls[0]["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert popen_calls[0]["start_new_session"] is True
     if manager_kind == "proxy":
         assert manager.runtime_evidence()["process_group"] is True
         assert manager.runtime_evidence()["process_executable"].endswith("/Python")
@@ -629,6 +648,15 @@ def test_proxy_persists_provisional_evidence_before_ready_inspection_failure(
     )
     delegated: list[ProcessIdentity] = []
     monkeypatch.setattr(proxy_manager_module, "inspect_process", lambda pid: recovered)
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "_proxy_identity_for_inspection",
+        lambda addon_path, runtime, inspection: ProcessIdentity(
+            program,
+            tuple(expected_arguments),
+            launcher_executables=(launcher,),
+        ),
+    )
     monkeypatch.setattr(
         proxy_manager_module,
         "terminate_owned_process",
@@ -963,7 +991,10 @@ def test_legacy_report_never_authorizes_echo_from_observed_argv(
     assert manager.state_path.exists()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework-Python re-exec integration")
+@pytest.mark.skipif(
+    sys.platform != "darwin" or "Python.framework" not in sys.executable,
+    reason="macOS framework-Python re-exec integration",
+)
 def test_real_report_server_persists_stable_native_identity_and_stops_after_reexec(tmp_path: Path) -> None:
     """Wait for the real framework child, verify status ownership, and remove state only after exit."""
     report_root = tmp_path / "report root with spaces"
@@ -1001,7 +1032,10 @@ def test_real_report_server_persists_stable_native_identity_and_stops_after_reex
             os.killpg(pid, signal.SIGKILL)
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework-Python legacy-state integration")
+@pytest.mark.skipif(
+    sys.platform != "darwin" or "Python.framework" not in sys.executable,
+    reason="macOS framework-Python legacy-state integration",
+)
 def test_real_report_server_stops_legacy_state_after_framework_reexec(tmp_path: Path) -> None:
     """Derive stable live report identity after old state fields are removed, then stop by single PID."""
     report_root = tmp_path / "legacy report root"
