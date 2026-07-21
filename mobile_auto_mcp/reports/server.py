@@ -13,6 +13,7 @@ from typing import Any
 
 from mobile_auto_mcp.platform.processes import (
     ProcessIdentity,
+    ProcessInspection,
     inspect_process,
     popen_session_kwargs,
     terminate_owned_process,
@@ -134,13 +135,14 @@ class ReportServerManager:
         if inspection.status == "not_found":
             self.state_path.unlink(missing_ok=True)
             return self._stop_result(pid, stopped=True, owned=False, ok=True)
-        process_identity = _report_process_identity_from_state(
+        process_identity = _report_process_identity_for_inspection(
             self.report_root,
             self.host,
             self.port,
             state,
+            inspection,
         )
-        owned = process_identity.matches(inspection.command)
+        owned = process_identity is not None
         if owned:
             result = terminate_owned_process(
                 pid,
@@ -167,12 +169,14 @@ class ReportServerManager:
         inspection = inspect_process(pid)
         return (
             inspection.status == "found"
-            and _report_process_identity_from_state(
+            and _report_process_identity_for_inspection(
                 self.report_root,
                 self.host,
                 self.port,
                 state,
-            ).matches(inspection.command)
+                inspection,
+            )
+            is not None
         )
 
     def _static_identity_matches(self, state: dict[str, Any]) -> bool:
@@ -262,6 +266,30 @@ def _report_process_identity_from_state(
     """Use the stable native executable captured after readiness, with legacy fallback."""
     executable = str(state.get("process_executable") or "") or None
     return _report_process_identity(report_root, host, port, executable=executable)
+
+
+def _report_process_identity_for_inspection(
+    report_root: Path,
+    host: str,
+    port: int,
+    state: dict[str, Any],
+    inspection: ProcessInspection,
+) -> ProcessIdentity | None:
+    """Use persisted stable identity or safely derive legacy identity from exact live invariant args."""
+    if inspection.status != "found":
+        return None
+    persisted = _report_process_identity_from_state(report_root, host, port, state)
+    if persisted.matches(inspection.command):
+        return persisted
+    if state.get("process_executable"):
+        return None
+    derived = _report_process_identity(
+        report_root,
+        host,
+        port,
+        executable=inspection.command[0],
+    )
+    return derived if derived.matches(inspection.command) else None
 
 
 def _lan_addresses() -> list[str]:

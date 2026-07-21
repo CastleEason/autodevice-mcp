@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -570,6 +571,79 @@ def test_managed_servers_start_in_an_independent_process_group(
         assert manager._read_state()["process_executable"].endswith("/Python")
 
 
+def test_proxy_persists_provisional_evidence_before_ready_inspection_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a listening child durably tracked when stable argv inspection cannot complete."""
+    manager = ProxyManager(tmp_path, target="android", port=13000)
+    readiness = iter([False, True, True])
+    clock = iter([0.0, 0.0, 0.0, 6.0])
+    observed_before_inspection: list[dict[str, Any]] = []
+
+    class FakeProcess:
+        """Represent a still-live child whose identity inspection is unavailable."""
+
+        pid = 4242
+
+        def poll(self) -> None:
+            """Keep the fake child live throughout the bounded startup attempt."""
+            return None
+
+    def fail_inspection(pid: int) -> ProcessInspection:
+        """Capture the already-written evidence before returning an inspection fault."""
+        observed_before_inspection.append(manager.runtime_evidence())
+        return ProcessInspection(status="inspection_failed", error="permission denied")
+
+    monkeypatch.setattr(proxy_manager_module, "_is_port_open", lambda port: next(readiness))
+    monkeypatch.setattr(proxy_manager_module.subprocess, "Popen", lambda argv, **kwargs: FakeProcess())
+    monkeypatch.setattr(proxy_manager_module, "inspect_process", fail_inspection)
+    monkeypatch.setattr(proxy_manager_module.time, "time", lambda: next(clock, 10.0))
+    monkeypatch.setattr(proxy_manager_module.time, "sleep", lambda seconds: None)
+
+    try:
+        with pytest.raises(RuntimeError, match="进程身份确认失败"):
+            manager.start()
+    finally:
+        for handle in (manager._stdout, manager._stderr):
+            if handle:
+                handle.close()
+
+    expected_arguments = ["-s", str(manager.addon_path.resolve())]
+    assert observed_before_inspection
+    assert observed_before_inspection[0]["pid"] == 4242
+    assert observed_before_inspection[0]["home"] == str(tmp_path.resolve())
+    assert observed_before_inspection[0]["addon"] == str(manager.addon_path.resolve())
+    assert observed_before_inspection[0]["process_group"] is True
+    assert observed_before_inspection[0]["identity_state"] == "provisional"
+    assert observed_before_inspection[0]["expected_executable"] == "mitmdump"
+    assert observed_before_inspection[0]["expected_arguments"] == expected_arguments
+    assert manager.runtime_evidence()["identity_state"] == "provisional"
+    assert manager.runtime_path.exists()
+
+    launcher = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+    program = "/Library/Frameworks/Python.framework/Versions/3.12/bin/mitmdump"
+    recovered = ProcessInspection(
+        status="found",
+        command=(launcher, program, "-p", "13000", *expected_arguments),
+    )
+    delegated: list[ProcessIdentity] = []
+    monkeypatch.setattr(proxy_manager_module, "inspect_process", lambda pid: recovered)
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "terminate_owned_process",
+        lambda pid, identity, *, process_group: delegated.append(identity)
+        or {"ok": True, "status": "stopped", "pid": pid},
+    )
+
+    manager.stop()
+
+    assert delegated == [
+        ProcessIdentity(program, tuple(expected_arguments), launcher_executables=(launcher,))
+    ]
+    assert not manager.runtime_path.exists()
+
+
 def test_proxy_retained_stop_uses_persisted_native_launcher_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -611,6 +685,46 @@ def test_proxy_retained_stop_uses_persisted_native_launcher_identity(
             launcher_executables=(launcher,),
         )
     ]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("mitmdump") is None,
+    reason="real macOS mitmdump legacy-state integration",
+)
+def test_real_proxy_stops_legacy_state_after_framework_reexec(tmp_path: Path) -> None:
+    """Derive stable live proxy identity after old state fields are removed, then stop by single PID."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    manager = ProxyManager(tmp_path / "legacy proxy home", target="android", port=port)
+    pid = 0
+    try:
+        manager.start()
+        legacy = manager.runtime_evidence()
+        pid = int(legacy["pid"])
+        for field in (
+            "process_executable",
+            "process_program",
+            "process_group",
+            "expected_executable",
+            "expected_arguments",
+            "identity_state",
+        ):
+            legacy.pop(field, None)
+        manager.runtime_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        result = manager.stop_owned_retained(legacy)
+
+        assert result["ok"] is True
+        assert result["status"] == "stopped"
+        assert inspect_process(pid).status == "not_found"
+        assert not manager.runtime_path.exists()
+    finally:
+        if pid > 0 and inspect_process(pid).status == "found":
+            os.killpg(pid, signal.SIGKILL)
+        for handle in (manager._stdout, manager._stderr):
+            if handle:
+                handle.close()
 
 
 def test_proxy_retained_stop_delegates_exact_addon_identity(
@@ -778,6 +892,36 @@ def test_real_report_server_persists_stable_native_identity_and_stops_after_reex
         assert stopped["ok"] is True
         assert stopped["stopped"] is True
         assert stopped["ownership_verified"] is True
+        assert inspect_process(pid).status == "not_found"
+        assert not manager.state_path.exists()
+    finally:
+        if pid > 0 and inspect_process(pid).status == "found":
+            os.killpg(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework-Python legacy-state integration")
+def test_real_report_server_stops_legacy_state_after_framework_reexec(tmp_path: Path) -> None:
+    """Derive stable live report identity after old state fields are removed, then stop by single PID."""
+    report_root = tmp_path / "legacy report root"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    manager = ReportServerManager(report_root, port=port)
+    pid = 0
+    try:
+        manager.start()
+        legacy = manager._read_state()
+        pid = int(legacy["pid"])
+        legacy.pop("process_executable", None)
+        legacy.pop("process_group", None)
+        manager._write_state(legacy)
+
+        assert manager.status()["running"] is True
+        result = manager.stop()
+
+        assert result["ok"] is True
+        assert result["stopped"] is True
+        assert result["ownership_verified"] is True
         assert inspect_process(pid).status == "not_found"
         assert not manager.state_path.exists()
     finally:

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 from mobile_auto_mcp.platform.processes import (
     ProcessIdentity,
@@ -62,11 +63,30 @@ class ProxyManager:
             text=True,
             **popen_session_kwargs(),
         )
+        runtime: dict[str, object] = {
+            "pid": self.process.pid,
+            "port": self.port,
+            "home": str(self.home.resolve()),
+            "addon": str(self.addon_path.resolve()),
+            "process_group": True,
+            "expected_executable": "mitmdump",
+            "expected_arguments": ["-s", str(self.addon_path.resolve())],
+            "identity_state": "provisional",
+            "started_at": time.time(),
+        }
+        try:
+            atomic_write_private_text(
+                self.runtime_path,
+                json.dumps(runtime, ensure_ascii=False, indent=2),
+            )
+        except OSError:
+            self._stop_untracked_spawn()
+            raise
         deadline = time.time() + 5
         identity_error = ""
         while time.time() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError("mitmproxy 启动失败，请检查代理插件加载和本机 Python 环境")
+                self._fail_start("mitmproxy 启动失败，请检查代理插件加载和本机 Python 环境")
             if _is_port_open(self.port):
                 inspection = inspect_process(self.process.pid)
                 stable_fields = _stable_proxy_identity_fields(self.addon_path, inspection)
@@ -79,38 +99,27 @@ class ProxyManager:
                     time.sleep(0.05)
                     continue
                 # Ownership metadata lets a later Runner safely reuse this intentionally retained process.
-                atomic_write_private_text(
-                    self.runtime_path,
-                    json.dumps(
-                        {
-                            "pid": self.process.pid,
-                            "port": self.port,
-                            "home": str(self.home.resolve()),
-                            "addon": str(self.addon_path.resolve()),
-                            "process_group": True,
-                            **stable_fields,
-                            "started_at": time.time(),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                )
+                runtime.update(stable_fields)
+                runtime["identity_state"] = "stable"
+                try:
+                    atomic_write_private_text(
+                        self.runtime_path,
+                        json.dumps(runtime, ensure_ascii=False, indent=2),
+                    )
+                except OSError:
+                    self._fail_start("mitmproxy 稳定进程身份持久化失败")
                 return {"ok": True, "reused": False, "pid": self.process.pid, "port": self.port}
             time.sleep(0.2)
         if identity_error:
-            raise RuntimeError(f"mitmproxy 进程身份确认失败：{identity_error}")
-        raise RuntimeError(f"mitmproxy 启动超时，端口 {self.port} 未进入监听状态")
+            self._fail_start(f"mitmproxy 进程身份确认失败：{identity_error}")
+        self._fail_start(f"mitmproxy 启动超时，端口 {self.port} 未进入监听状态")
 
     def stop(self) -> None:
         """Stop only a process started by this manager; retained reused processes remain externally managed."""
         if not self.process:
             return
         if self.process.poll() is None:
-            result = terminate_owned_process(
-                self.process.pid,
-                _proxy_identity(self.addon_path, self._read_runtime()),
-                process_group=True,
-            )
+            result = self.stop_owned_retained(self._read_runtime())
             if not result.get("ok", False):
                 return
         self.process = None
@@ -120,6 +129,34 @@ class ProxyManager:
         self._stdout = None
         self._stderr = None
         self.runtime_path.unlink(missing_ok=True)
+
+    def _fail_start(self, message: str) -> NoReturn:
+        """Attempt evidence-gated cleanup after startup failure and retain state when proof is unavailable."""
+        cleanup = self.stop_owned_retained(self._read_runtime())
+        if cleanup.get("ok", False):
+            self.process = None
+        for handle in (self._stdout, self._stderr):
+            if handle:
+                handle.close()
+        self._stdout = None
+        self._stderr = None
+        raise RuntimeError(message)
+
+    def _stop_untracked_spawn(self) -> None:
+        """Stop the directly owned Popen child if provisional evidence cannot be persisted."""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=1)
+        self.process = None
+        for handle in (self._stdout, self._stderr):
+            if handle:
+                handle.close()
+        self._stdout = None
+        self._stderr = None
 
     def stop_owned_retained(self, runtime: dict[str, object] | None = None) -> dict[str, object]:
         """Stop a retained mitmdump only after durable home, port, addon, PID, and command ownership checks pass."""
@@ -142,8 +179,8 @@ class ProxyManager:
                 "port": self.port,
                 "error": inspection.error,
             }
-        process_identity = _proxy_identity(self.addon_path, evidence)
-        if not process_identity.matches(inspection.command):
+        process_identity = _proxy_identity_for_inspection(self.addon_path, evidence, inspection)
+        if process_identity is None:
             return {"ok": False, "status": "ownership_mismatch", "pid": pid, "port": self.port}
         result = terminate_owned_process(
             pid,
@@ -212,7 +249,7 @@ class ProxyManager:
         if inspection.status == "not_found":
             return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
         # PID reuse is possible after the original Runner exits, so command identity is mandatory before signaling.
-        if not _proxy_identity(self.addon_path, runtime).matches(inspection.command):
+        if _proxy_identity_for_inspection(self.addon_path, runtime, inspection) is None:
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         return {"ok": True, "status": "owned", "pid": pid, "port": self.port}
 
@@ -238,6 +275,12 @@ class ProxyManager:
         process_program = str(runtime.get("process_program") or "")
         if bool(process_executable) != bool(process_program):
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
+        expected_executable = runtime.get("expected_executable")
+        expected_arguments = runtime.get("expected_arguments")
+        if expected_executable is not None and expected_executable != "mitmdump":
+            return {"ok": False, "status": "ownership_mismatch", "pid": pid}
+        if expected_arguments is not None and expected_arguments != ["-s", expected["addon"]]:
+            return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         return {"ok": True, "status": "owned", "pid": pid, "port": port}
 
 
@@ -255,7 +298,10 @@ def _pid_matches_runtime(
 ) -> bool:
     """Verify a retained PID still runs mitmdump with this project's exact addon path."""
     inspection = inspect_process(pid)
-    return inspection.status == "found" and _proxy_identity(addon_path, runtime).matches(inspection.command)
+    return (
+        inspection.status == "found"
+        and _proxy_identity_for_inspection(addon_path, runtime or {}, inspection) is not None
+    )
 
 
 def _pid_exists(pid: int) -> bool:
@@ -312,3 +358,23 @@ def _stable_proxy_identity_fields(
                 "process_program": command[1],
             }
     return None
+
+
+def _proxy_identity_for_inspection(
+    addon_path: Path,
+    runtime: dict[str, object],
+    inspection: ProcessInspection,
+) -> ProcessIdentity | None:
+    """Use persisted stable identity or safely derive legacy identity from exact live invariant args."""
+    if inspection.status != "found":
+        return None
+    persisted = _proxy_identity(addon_path, runtime)
+    if persisted.matches(inspection.command):
+        return persisted
+    if runtime.get("process_executable") or runtime.get("process_program"):
+        return None
+    stable_fields = _stable_proxy_identity_fields(addon_path, inspection)
+    if stable_fields is None:
+        return None
+    derived = _proxy_identity(addon_path, stable_fields)
+    return derived if derived.matches(inspection.command) else None
