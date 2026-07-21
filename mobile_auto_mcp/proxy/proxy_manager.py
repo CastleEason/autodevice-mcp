@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import socket
 import subprocess
 import time
 from pathlib import Path
 
+from mobile_auto_mcp.platform.processes import (
+    ProcessIdentity,
+    popen_session_kwargs,
+    process_command,
+    terminate_owned_process,
+)
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
 
@@ -47,7 +52,14 @@ class ProxyManager:
         log_dir = ensure_private_directory(self.home / "proxy")
         self._stdout = (log_dir / "mitmdump_stdout.log").open("a", encoding="utf-8")
         self._stderr = (log_dir / "mitmdump_stderr.log").open("a", encoding="utf-8")
-        self.process = subprocess.Popen(cmd, env=env, stdout=self._stdout, stderr=self._stderr, text=True)
+        self.process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=self._stdout,
+            stderr=self._stderr,
+            text=True,
+            **popen_session_kwargs(),
+        )
         deadline = time.time() + 5
         while time.time() < deadline:
             if self.process.poll() is not None:
@@ -77,12 +89,9 @@ class ProxyManager:
         if not self.process:
             return
         if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            result = terminate_owned_process(self.process.pid, _proxy_identity(self.addon_path))
+            if not result.get("ok", False):
+                return
         self.process = None
         for handle in (self._stdout, self._stderr):
             if handle:
@@ -103,35 +112,11 @@ class ProxyManager:
             # no signal is sent, so PID-reuse protection is not weakened.
             self.runtime_path.unlink(missing_ok=True)
             return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
-        validation = self._validate_runtime(evidence)
-        if not validation.get("ok", False):
-            return validation
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            # A vanished owned PID is already stopped; cleanup can safely remove only this manager's record.
+        result = terminate_owned_process(pid, _proxy_identity(self.addon_path))
+        result.setdefault("port", self.port)
+        if result.get("ok", False):
             self.runtime_path.unlink(missing_ok=True)
-            return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
-        except OSError as exc:
-            return {"ok": False, "status": "stop_failed", "pid": pid, "error": str(exc)}
-
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _pid_exists(pid):
-            time.sleep(0.1)
-        if _pid_exists(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError as exc:
-                return {"ok": False, "status": "kill_failed", "pid": pid, "error": str(exc)}
-            kill_deadline = time.monotonic() + 2
-            while time.monotonic() < kill_deadline and _pid_exists(pid):
-                time.sleep(0.1)
-        if _pid_exists(pid):
-            return {"ok": False, "status": "still_running", "pid": pid, "port": self.port}
-        self.runtime_path.unlink(missing_ok=True)
-        return {"ok": True, "status": "stopped", "pid": pid, "port": self.port}
+        return result
 
     def runtime_evidence(self) -> dict[str, object]:
         """Return persisted ownership metadata for durable retained-proxy recovery."""
@@ -213,25 +198,14 @@ def _is_port_open(port: int) -> bool:
 
 def _pid_matches_runtime(pid: int, addon_path: Path) -> bool:
     """Verify a retained PID still runs mitmdump with this project's exact addon path."""
-    try:
-        command = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "mitmdump" in command and str(addon_path.resolve()) in command
+    return _proxy_identity(addon_path).matches(process_command(pid))
 
 
 def _pid_exists(pid: int) -> bool:
     """Return whether a PID still exists without sending a state-changing signal."""
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return bool(process_command(int(pid)))
+
+
+def _proxy_identity(addon_path: Path) -> ProcessIdentity:
+    """Build the exact addon argv identity required before stopping a managed mitmdump."""
+    return ProcessIdentity("mitmdump", ("-s", str(addon_path.resolve())))

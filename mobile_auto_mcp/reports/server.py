@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
-import signal
-import shlex
 import socket
 import subprocess
 import sys
@@ -14,6 +11,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mobile_auto_mcp.platform.processes import (
+    ProcessIdentity,
+    popen_session_kwargs,
+    process_command,
+    terminate_owned_process,
+)
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
 
 
@@ -46,7 +49,7 @@ class ReportServerManager:
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
+                **popen_session_kwargs(),
             )
         self._write_state({"pid": process.pid, "host": self.host, "port": self.port, "report_root": str(self.report_root), "started_at": time.time()})
         deadline = time.time() + 3
@@ -83,26 +86,15 @@ class ReportServerManager:
         pid = int(state.get("pid") or 0)
         owned = self._owns_process(pid, state)
         if owned:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            exited = _wait_for_exit(pid, timeout=3)
-            if not exited and self._owns_process(pid, state):
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                exited = _wait_for_exit(pid, timeout=1)
+            result = terminate_owned_process(
+                pid,
+                _report_process_identity(self.report_root, self.host, self.port),
+            )
+            exited = bool(result.get("ok", False))
         else:
             exited = True
-        self.state_path.unlink(missing_ok=True)
+        if exited:
+            self.state_path.unlink(missing_ok=True)
         return {
             "ok": True,
             "stopped": exited,
@@ -113,8 +105,6 @@ class ReportServerManager:
 
     def _owns_process(self, pid: int, state: dict[str, Any]) -> bool:
         """Verify persisted metadata and the live command before trusting or terminating a PID."""
-        if not _pid_alive(pid):
-            return False
         try:
             state_root = Path(str(state.get("report_root") or "")).expanduser().resolve()
             state_port = int(state.get("port") or 0)
@@ -123,18 +113,8 @@ class ReportServerManager:
             return False
         if state_root != self.report_root or state_port != self.port or state_host != self.host:
             return False
-        try:
-            command = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "command="],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=1,
-            ).stdout.strip()
-            argv = shlex.split(command)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return False
-        return _matches_report_server_command(argv, self.report_root, self.host, self.port)
+        command = process_command(pid)
+        return _report_process_identity(self.report_root, self.host, self.port).matches(command)
 
     def _port_ready(self, port: int | None = None) -> bool:
         """Probe the configured listener locally without relying on external network access."""
@@ -156,48 +136,27 @@ class ReportServerManager:
         atomic_write_private_text(self.state_path, json.dumps(state, ensure_ascii=False, indent=2))
 
 
-def _pid_alive(pid: int) -> bool:
-    """Check process existence without sending a terminating signal."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
-
 def _matches_report_server_command(argv: list[str], report_root: Path, host: str, port: int) -> bool:
     """Match the identifying arguments of the stdlib HTTP server launched by this manager."""
-    try:
-        module_index = argv.index("-m")
-        directory_index = argv.index("--directory")
-        bind_index = argv.index("--bind")
-        actual_root = Path(argv[directory_index + 1]).expanduser().resolve()
-        return (
-            argv[module_index + 1] == "http.server"
-            and argv[module_index + 2] == str(port)
-            and argv[bind_index + 1] == host
-            and actual_root == report_root
-        )
-    except (IndexError, OSError, ValueError):
-        return False
+    return _report_process_identity(report_root, host, port).matches(argv)
 
 
-def _wait_for_exit(pid: int, *, timeout: float) -> bool:
-    """Wait for process exit and reap it when this manager is the direct parent."""
-    deadline = time.monotonic() + max(0.0, timeout)
-    while time.monotonic() < deadline:
-        try:
-            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
-            if waited_pid == pid:
-                return True
-        except ChildProcessError:
-            pass
-        if not _pid_alive(pid):
-            return True
-        time.sleep(0.05)
-    return not _pid_alive(pid)
+def _report_process_identity(report_root: Path, host: str, port: int) -> ProcessIdentity:
+    """Build the exact Python module and report-root argv identity for the managed server."""
+    return ProcessIdentity(
+        Path(sys.executable).name,
+        (
+            "-m",
+            "http.server",
+            str(port),
+            "--bind",
+            host,
+            "--directory",
+            str(report_root.expanduser().resolve()),
+        ),
+    )
+
+
 def _lan_addresses() -> list[str]:
     """Return non-loopback IPv4 addresses suitable for same-LAN report access."""
     addresses: set[str] = set()
