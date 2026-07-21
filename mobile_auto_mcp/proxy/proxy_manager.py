@@ -12,6 +12,7 @@ from pathlib import Path
 
 from mobile_auto_mcp.platform.processes import (
     ProcessIdentity,
+    ProcessInspection,
     inspect_process,
     popen_session_kwargs,
     terminate_owned_process,
@@ -62,10 +63,21 @@ class ProxyManager:
             **popen_session_kwargs(),
         )
         deadline = time.time() + 5
+        identity_error = ""
         while time.time() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError("mitmproxy 启动失败，请检查代理插件加载和本机 Python 环境")
             if _is_port_open(self.port):
+                inspection = inspect_process(self.process.pid)
+                stable_fields = _stable_proxy_identity_fields(self.addon_path, inspection)
+                if stable_fields is None:
+                    identity_error = (
+                        inspection.error
+                        if inspection.status == "inspection_failed"
+                        else "mitmproxy 就绪后的进程命令与启动参数不匹配"
+                    )
+                    time.sleep(0.05)
+                    continue
                 # Ownership metadata lets a later Runner safely reuse this intentionally retained process.
                 atomic_write_private_text(
                     self.runtime_path,
@@ -76,6 +88,7 @@ class ProxyManager:
                             "home": str(self.home.resolve()),
                             "addon": str(self.addon_path.resolve()),
                             "process_group": True,
+                            **stable_fields,
                             "started_at": time.time(),
                         },
                         ensure_ascii=False,
@@ -84,6 +97,8 @@ class ProxyManager:
                 )
                 return {"ok": True, "reused": False, "pid": self.process.pid, "port": self.port}
             time.sleep(0.2)
+        if identity_error:
+            raise RuntimeError(f"mitmproxy 进程身份确认失败：{identity_error}")
         raise RuntimeError(f"mitmproxy 启动超时，端口 {self.port} 未进入监听状态")
 
     def stop(self) -> None:
@@ -93,7 +108,7 @@ class ProxyManager:
         if self.process.poll() is None:
             result = terminate_owned_process(
                 self.process.pid,
-                _proxy_identity(self.addon_path),
+                _proxy_identity(self.addon_path, self._read_runtime()),
                 process_group=True,
             )
             if not result.get("ok", False):
@@ -127,7 +142,7 @@ class ProxyManager:
                 "port": self.port,
                 "error": inspection.error,
             }
-        process_identity = _proxy_identity(self.addon_path)
+        process_identity = _proxy_identity(self.addon_path, evidence)
         if not process_identity.matches(inspection.command):
             return {"ok": False, "status": "ownership_mismatch", "pid": pid, "port": self.port}
         result = terminate_owned_process(
@@ -169,7 +184,7 @@ class ProxyManager:
             return None
         if str(runtime.get("addon") or "") != str(self.addon_path.resolve()):
             return None
-        return runtime if pid > 0 and _pid_matches_runtime(pid, self.addon_path) else None
+        return runtime if pid > 0 and _pid_matches_runtime(pid, self.addon_path, runtime) else None
 
     def _read_runtime(self) -> dict[str, object] | None:
         """Read retained runtime evidence without treating malformed or non-object JSON as owned state."""
@@ -197,7 +212,7 @@ class ProxyManager:
         if inspection.status == "not_found":
             return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
         # PID reuse is possible after the original Runner exits, so command identity is mandatory before signaling.
-        if not _proxy_identity(self.addon_path).matches(inspection.command):
+        if not _proxy_identity(self.addon_path, runtime).matches(inspection.command):
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         return {"ok": True, "status": "owned", "pid": pid, "port": self.port}
 
@@ -219,6 +234,10 @@ class ProxyManager:
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         if str(runtime.get("addon") or "") != expected["addon"]:
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
+        process_executable = str(runtime.get("process_executable") or "")
+        process_program = str(runtime.get("process_program") or "")
+        if bool(process_executable) != bool(process_program):
+            return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         return {"ok": True, "status": "owned", "pid": pid, "port": port}
 
 
@@ -229,10 +248,14 @@ def _is_port_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", int(port))) == 0
 
 
-def _pid_matches_runtime(pid: int, addon_path: Path) -> bool:
+def _pid_matches_runtime(
+    pid: int,
+    addon_path: Path,
+    runtime: dict[str, object] | None = None,
+) -> bool:
     """Verify a retained PID still runs mitmdump with this project's exact addon path."""
     inspection = inspect_process(pid)
-    return inspection.status == "found" and _proxy_identity(addon_path).matches(inspection.command)
+    return inspection.status == "found" and _proxy_identity(addon_path, runtime).matches(inspection.command)
 
 
 def _pid_exists(pid: int) -> bool:
@@ -240,10 +263,52 @@ def _pid_exists(pid: int) -> bool:
     return inspect_process(int(pid)).status == "found"
 
 
-def _proxy_identity(addon_path: Path) -> ProcessIdentity:
+def _proxy_identity(
+    addon_path: Path,
+    runtime: dict[str, object] | None = None,
+) -> ProcessIdentity:
     """Build the exact addon argv identity required before stopping a managed mitmdump."""
+    evidence = runtime or {}
+    process_executable = str(evidence.get("process_executable") or "")
+    process_program = str(evidence.get("process_program") or "")
+    if process_executable and process_program:
+        launchers = () if process_executable == process_program else (process_executable,)
+        return ProcessIdentity(
+            process_program,
+            ("-s", str(addon_path.resolve())),
+            launcher_executables=launchers,
+        )
     return ProcessIdentity(
         "mitmdump",
         ("-s", str(addon_path.resolve())),
         launcher_executables=(Path(sys.executable).name,),
     )
+
+
+def _stable_proxy_identity_fields(
+    addon_path: Path,
+    inspection: ProcessInspection,
+) -> dict[str, str] | None:
+    """Capture the native launcher/program pair only after the ready PID matches owned proxy args."""
+    if inspection.status != "found":
+        return None
+    command = inspection.command
+    required_arguments = ("-s", str(addon_path.resolve()))
+    direct = ProcessIdentity("mitmdump", required_arguments)
+    if direct.matches(command):
+        return {
+            "process_executable": command[0],
+            "process_program": command[0],
+        }
+    if len(command) > 1:
+        launched = ProcessIdentity(
+            "mitmdump",
+            required_arguments,
+            launcher_executables=(command[0],),
+        )
+        if launched.matches(command):
+            return {
+                "process_executable": command[0],
+                "process_program": command[1],
+            }
+    return None

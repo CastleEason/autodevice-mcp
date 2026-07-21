@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -64,6 +66,48 @@ def test_darwin_process_command_uses_native_argv_reader(monkeypatch: pytest.Monk
     monkeypatch.setattr(processes, "_read_darwin_command", lambda pid: expected, raising=False)
 
     assert inspect_process(4242, "Darwin") == ProcessInspection(status="found", command=expected)
+
+
+def test_darwin_einval_for_a_live_pid_is_inspection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve evidence when KERN_PROCARGS2 rejects a PID that a safe liveness probe confirms exists."""
+    probes: list[tuple[int, int]] = []
+
+    def unavailable(pid: int) -> tuple[str, ...]:
+        """Emulate KERN_PROCARGS2 denying argv for an otherwise live process."""
+        raise OSError(errno.EINVAL, "argv unavailable")
+
+    monkeypatch.setattr(processes, "_read_darwin_command", unavailable)
+    monkeypatch.setattr(processes.os, "kill", lambda pid, sig: probes.append((pid, sig)))
+
+    inspection = inspect_process(4242, "Darwin")
+
+    assert inspection.status == "inspection_failed"
+    assert inspection.error == "[Errno 22] argv unavailable"
+    assert probes == [(4242, 0)]
+
+
+def test_darwin_einval_is_not_found_only_after_a_safe_absence_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Classify EINVAL as absence only when signal zero independently confirms ESRCH."""
+    probes: list[tuple[int, int]] = []
+
+    def unavailable(pid: int) -> tuple[str, ...]:
+        """Emulate the ambiguous KERN_PROCARGS2 response used for vanished PIDs."""
+        raise OSError(errno.EINVAL, "argv unavailable")
+
+    def absent(pid: int, sig: int) -> None:
+        """Emulate the non-mutating liveness probe confirming PID absence."""
+        probes.append((pid, sig))
+        raise ProcessLookupError(errno.ESRCH, "no such process")
+
+    monkeypatch.setattr(processes, "_read_darwin_command", unavailable)
+    monkeypatch.setattr(processes.os, "kill", absent)
+
+    assert inspect_process(4242, "Darwin") == ProcessInspection(status="not_found")
+    assert probes == [(4242, 0)]
 
 
 def test_process_command_uses_powershell_cim_on_windows() -> None:
@@ -170,6 +214,24 @@ def test_identity_requires_executable_marker_before_owned_arguments() -> None:
     assert identity.matches(["unrelated", "-s", "/owned/proxy_addon.py", "mitmdump"], "Linux") is False
     assert identity.matches(["echo", "mitmdump", "-s", "/owned/proxy_addon.py"], "Linux") is False
     assert identity.matches(["python3", "/venv/bin/mitmdump", "-s", "/owned/proxy_addon.py"], "Linux") is True
+
+
+def test_absolute_native_executable_identity_does_not_match_a_same_named_binary_elsewhere() -> None:
+    """Bind a persisted native executable path exactly instead of reducing it to a basename."""
+    identity = ProcessIdentity(
+        "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+        ("-m", "http.server"),
+    )
+
+    assert identity.matches(
+        [
+            "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+            "-m",
+            "http.server",
+        ],
+        "Darwin",
+    )
+    assert not identity.matches(["/tmp/unrelated/Python", "-m", "http.server"], "Darwin")
 
 
 def test_posix_termination_revalidates_ownership_before_forcing(
@@ -448,6 +510,23 @@ def test_managed_servers_start_in_an_independent_process_group(
         readiness = iter([False, True])
         monkeypatch.setattr(proxy_manager_module, "_is_port_open", lambda port: next(readiness))
         monkeypatch.setattr(proxy_manager_module.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            proxy_manager_module,
+            "inspect_process",
+            lambda pid: ProcessInspection(
+                status="found",
+                command=(
+                    "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/bin/mitmdump",
+                    "-p",
+                    "13000",
+                    "-s",
+                    str(manager.addon_path.resolve()),
+                    "--set",
+                    "block_global=false",
+                ),
+            ),
+        )
         try:
             result = manager.start()
         finally:
@@ -460,6 +539,23 @@ def test_managed_servers_start_in_an_independent_process_group(
         monkeypatch.setattr(manager, "status", lambda: {"running": False})
         monkeypatch.setattr(manager, "_port_ready", lambda port=None: next(readiness))
         monkeypatch.setattr(report_server_module.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            report_server_module,
+            "inspect_process",
+            lambda pid: ProcessInspection(
+                status="found",
+                command=(
+                    "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+                    "-m",
+                    "http.server",
+                    "13080",
+                    "--bind",
+                    "127.0.0.1",
+                    "--directory",
+                    str(manager.report_root),
+                ),
+            ),
+        )
         result = manager.start()
 
     assert result["ok"] is True
@@ -467,8 +563,54 @@ def test_managed_servers_start_in_an_independent_process_group(
     assert popen_calls[0]["start_new_session"] is True
     if manager_kind == "proxy":
         assert manager.runtime_evidence()["process_group"] is True
+        assert manager.runtime_evidence()["process_executable"].endswith("/Python")
+        assert manager.runtime_evidence()["process_program"].endswith("/mitmdump")
     else:
         assert manager._read_state()["process_group"] is True
+        assert manager._read_state()["process_executable"].endswith("/Python")
+
+
+def test_proxy_retained_stop_uses_persisted_native_launcher_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop a re-executed mitmdump through the exact stable launcher and program captured at readiness."""
+    manager = ProxyManager(tmp_path, target="android", port=13000)
+    launcher = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+    program = "/Library/Frameworks/Python.framework/Versions/3.12/bin/mitmdump"
+    runtime = {
+        "pid": 4242,
+        "port": manager.port,
+        "home": str(tmp_path.resolve()),
+        "addon": str(manager.addon_path.resolve()),
+        "process_executable": launcher,
+        "process_program": program,
+        "process_group": True,
+    }
+    command = (launcher, program, "-p", "13000", "-s", str(manager.addon_path.resolve()))
+    delegated: list[ProcessIdentity] = []
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "inspect_process",
+        lambda pid: ProcessInspection(status="found", command=command),
+    )
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "terminate_owned_process",
+        lambda pid, identity, *, process_group: delegated.append(identity)
+        or {"ok": True, "status": "stopped", "pid": pid},
+    )
+
+    result = manager.stop_owned_retained(runtime)
+
+    assert result["ok"] is True
+    assert delegated == [
+        ProcessIdentity(
+            program,
+            ("-s", str(manager.addon_path.resolve())),
+            launcher_executables=(launcher,),
+        )
+    ]
 
 
 def test_proxy_retained_stop_delegates_exact_addon_identity(
@@ -574,6 +716,73 @@ def test_report_stop_delegates_exact_root_identity_and_keeps_failed_evidence(
         ),
     ]
     assert manager._read_state() == state
+
+
+def test_report_identity_mismatch_is_not_reported_stopped_and_preserves_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep report recovery state when the recorded PID has a different live command."""
+    manager = ReportServerManager(tmp_path, port=13080)
+    state = {
+        "pid": 4242,
+        "host": manager.host,
+        "port": manager.port,
+        "report_root": str(manager.report_root),
+        "process_executable": "/stable/Python",
+        "process_group": True,
+    }
+    manager._write_state(state)
+    monkeypatch.setattr(
+        report_server_module,
+        "inspect_process",
+        lambda pid: ProcessInspection(status="found", command=("/tmp/unrelated/Python", "-m", "http.server")),
+    )
+
+    result = manager.stop()
+
+    assert result["ok"] is False
+    assert result["stopped"] is False
+    assert result["ownership_verified"] is False
+    assert manager._read_state() == state
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework-Python re-exec integration")
+def test_real_report_server_persists_stable_native_identity_and_stops_after_reexec(tmp_path: Path) -> None:
+    """Wait for the real framework child, verify status ownership, and remove state only after exit."""
+    report_root = tmp_path / "report root with spaces"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    manager = ReportServerManager(report_root, port=port)
+    pid = 0
+    try:
+        started = manager.start()
+        state = manager._read_state()
+        pid = int(state["pid"])
+        deadline = time.monotonic() + 3
+        stable = ProcessInspection(status="inspection_failed", error="not ready")
+        while time.monotonic() < deadline:
+            stable = inspect_process(pid)
+            if stable.status == "found" and stable.command[0] == state.get("process_executable"):
+                break
+            time.sleep(0.02)
+
+        assert started["ok"] is True
+        assert stable.status == "found"
+        assert stable.command[0].endswith("/Python")
+        assert manager.status()["running"] is True
+
+        stopped = manager.stop()
+
+        assert stopped["ok"] is True
+        assert stopped["stopped"] is True
+        assert stopped["ownership_verified"] is True
+        assert inspect_process(pid).status == "not_found"
+        assert not manager.state_path.exists()
+    finally:
+        if pid > 0 and inspect_process(pid).status == "found":
+            os.killpg(pid, signal.SIGKILL)
 
 
 @pytest.mark.parametrize("manager_kind", ["proxy", "report"])

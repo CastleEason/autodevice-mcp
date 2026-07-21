@@ -43,18 +43,16 @@ class ProcessIdentity:
         if not command or not self.executable or not self.required_arguments:
             return False
         host_platform = system or platform.system()
-        expected_executable = _normalized_basename(self.executable, host_platform)
         program_index: int | None = None
-        if _normalized_basename(command[0], host_platform) == expected_executable:
+        if _executable_matches(command[0], self.executable, host_platform):
             program_index = 0
         elif len(command) > 1:
-            launchers = {
-                _normalized_basename(launcher, host_platform)
-                for launcher in self.launcher_executables
-            }
             if (
-                _normalized_basename(command[0], host_platform) in launchers
-                and _normalized_basename(command[1], host_platform) == expected_executable
+                any(
+                    _executable_matches(command[0], launcher, host_platform)
+                    for launcher in self.launcher_executables
+                )
+                and _executable_matches(command[1], self.executable, host_platform)
             ):
                 program_index = 1
         if program_index is None:
@@ -199,9 +197,17 @@ def _inspect_darwin(pid: int) -> ProcessInspection:
     try:
         command = tuple(_read_darwin_command(pid))
     except OSError as exc:
-        # KERN_PROCARGS2 reports EINVAL for a PID that no longer exists on supported macOS releases.
-        if exc.errno in {errno.EINVAL, errno.ENOENT, errno.ESRCH}:
+        if exc.errno in {errno.ENOENT, errno.ESRCH}:
             return ProcessInspection(status="not_found")
+        if exc.errno == errno.EINVAL:
+            # KERN_PROCARGS2 also returns EINVAL for live protected/uninspectable processes, so a
+            # separate non-mutating liveness probe must confirm absence before evidence is erased.
+            try:
+                os.kill(pid, 0)
+            except OSError as probe_error:
+                if probe_error.errno == errno.ESRCH:
+                    return ProcessInspection(status="not_found")
+            return ProcessInspection(status="inspection_failed", error=str(exc))
         return ProcessInspection(status="inspection_failed", error=str(exc))
     except (IndexError, struct.error, ValueError) as exc:
         return ProcessInspection(status="inspection_failed", error=str(exc))
@@ -383,7 +389,7 @@ def _wait_for_exit(pid: int, system: str, timeout: float) -> ProcessInspection:
             except ChildProcessError:
                 pass
         inspection = inspect_process(pid, system)
-        if inspection.status != "found" or time.monotonic() >= deadline:
+        if inspection.status == "not_found" or time.monotonic() >= deadline:
             return inspection
         time.sleep(0.05)
 
@@ -397,6 +403,19 @@ def _normalized_basename(token: str, system: str) -> str:
     """Extract and normalize one executable basename with the selected host's path syntax."""
     basename = ntpath.basename(token) if system == "Windows" else os.path.basename(token)
     return _normalized_token(basename, system)
+
+
+def _executable_matches(actual: str, expected: str, system: str) -> bool:
+    """Match persisted absolute executable paths exactly and portable command names by basename."""
+    path_module = ntpath if system == "Windows" else os.path
+    if path_module.isabs(expected):
+        if not path_module.isabs(actual):
+            return False
+        return _normalized_token(path_module.normpath(actual), system) == _normalized_token(
+            path_module.normpath(expected),
+            system,
+        )
+    return _normalized_basename(actual, system) == _normalized_basename(expected, system)
 
 
 def _strip_wrapping_quotes(token: str) -> str:

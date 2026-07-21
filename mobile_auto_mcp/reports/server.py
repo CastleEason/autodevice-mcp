@@ -51,24 +51,45 @@ class ReportServerManager:
                 stderr=subprocess.STDOUT,
                 **popen_session_kwargs(),
             )
-        self._write_state(
-            {
-                "pid": process.pid,
-                "host": self.host,
-                "port": self.port,
-                "report_root": str(self.report_root),
-                "process_group": True,
-                "started_at": time.time(),
-            }
-        )
+        state = {
+            "pid": process.pid,
+            "host": self.host,
+            "port": self.port,
+            "report_root": str(self.report_root),
+            "process_group": True,
+            "started_at": time.time(),
+        }
+        self._write_state(state)
         deadline = time.time() + 3
+        identity_error = ""
         while time.time() < deadline:
             if process.poll() is not None:
                 break
             if self._port_ready():
-                return {"ok": True, "already_running": False, **self.status()}
+                inspection = inspect_process(process.pid)
+                if inspection.status == "found":
+                    stable_identity = _report_process_identity(
+                        self.report_root,
+                        self.host,
+                        self.port,
+                        executable=inspection.command[0],
+                    )
+                    if stable_identity.matches(inspection.command):
+                        state["process_executable"] = inspection.command[0]
+                        self._write_state(state)
+                        return {"ok": True, "already_running": False, **self.status()}
+                    identity_error = "报告服务就绪后的进程命令与启动参数不匹配"
+                elif inspection.status == "inspection_failed":
+                    identity_error = inspection.error or "报告服务进程身份检查失败"
+                else:
+                    identity_error = "报告服务进程在身份确认前退出"
             time.sleep(0.05)
-        return {"ok": False, **self.status(), "error": "报告服务启动后未能监听端口", "log": str(self.log_path)}
+        return {
+            "ok": False,
+            **self.status(),
+            "error": identity_error or "报告服务启动后未能监听端口",
+            "log": str(self.log_path),
+        }
 
     def status(self) -> dict[str, Any]:
         """Read persisted lifecycle state and verify both process and TCP port are alive."""
@@ -94,8 +115,13 @@ class ReportServerManager:
         state = self._read_state()
         pid = int(state.get("pid") or 0)
         if not self._static_identity_matches(state):
-            self.state_path.unlink(missing_ok=True)
-            return self._stop_result(pid, stopped=True, owned=False, ok=True)
+            return self._stop_result(
+                pid,
+                stopped=False,
+                owned=False,
+                ok=False,
+                error="report server state does not match this manager",
+            )
         inspection = inspect_process(pid)
         if inspection.status == "inspection_failed":
             return self._stop_result(
@@ -108,24 +134,30 @@ class ReportServerManager:
         if inspection.status == "not_found":
             self.state_path.unlink(missing_ok=True)
             return self._stop_result(pid, stopped=True, owned=False, ok=True)
-        owned = _report_process_identity(self.report_root, self.host, self.port).matches(inspection.command)
+        process_identity = _report_process_identity_from_state(
+            self.report_root,
+            self.host,
+            self.port,
+            state,
+        )
+        owned = process_identity.matches(inspection.command)
         if owned:
             result = terminate_owned_process(
                 pid,
-                _report_process_identity(self.report_root, self.host, self.port),
+                process_identity,
                 process_group=state.get("process_group") is True,
             )
             exited = bool(result.get("ok", False))
         else:
-            exited = True
+            exited = False
         if exited:
             self.state_path.unlink(missing_ok=True)
         return self._stop_result(
             pid,
             stopped=exited,
             owned=owned,
-            ok=bool(result.get("ok", False)) if owned else True,
-            error=str(result.get("error") or "") if owned else "",
+            ok=bool(result.get("ok", False)) if owned else False,
+            error=str(result.get("error") or "") if owned else "process ownership mismatch",
         )
 
     def _owns_process(self, pid: int, state: dict[str, Any]) -> bool:
@@ -135,7 +167,12 @@ class ReportServerManager:
         inspection = inspect_process(pid)
         return (
             inspection.status == "found"
-            and _report_process_identity(self.report_root, self.host, self.port).matches(inspection.command)
+            and _report_process_identity_from_state(
+                self.report_root,
+                self.host,
+                self.port,
+                state,
+            ).matches(inspection.command)
         )
 
     def _static_identity_matches(self, state: dict[str, Any]) -> bool:
@@ -194,10 +231,16 @@ def _matches_report_server_command(argv: list[str], report_root: Path, host: str
     return _report_process_identity(report_root, host, port).matches(argv)
 
 
-def _report_process_identity(report_root: Path, host: str, port: int) -> ProcessIdentity:
+def _report_process_identity(
+    report_root: Path,
+    host: str,
+    port: int,
+    *,
+    executable: str | None = None,
+) -> ProcessIdentity:
     """Build the exact Python module and report-root argv identity for the managed server."""
     return ProcessIdentity(
-        Path(sys.executable).name,
+        executable or Path(sys.executable).name,
         (
             "-m",
             "http.server",
@@ -208,6 +251,17 @@ def _report_process_identity(report_root: Path, host: str, port: int) -> Process
             str(report_root.expanduser().resolve()),
         ),
     )
+
+
+def _report_process_identity_from_state(
+    report_root: Path,
+    host: str,
+    port: int,
+    state: dict[str, Any],
+) -> ProcessIdentity:
+    """Use the stable native executable captured after readiness, with legacy fallback."""
+    executable = str(state.get("process_executable") or "") or None
+    return _report_process_identity(report_root, host, port, executable=executable)
 
 
 def _lan_addresses() -> list[str]:
