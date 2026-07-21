@@ -6,13 +6,14 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from mobile_auto_mcp.platform.processes import (
     ProcessIdentity,
+    inspect_process,
     popen_session_kwargs,
-    process_command,
     terminate_owned_process,
 )
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
@@ -74,6 +75,7 @@ class ProxyManager:
                             "port": self.port,
                             "home": str(self.home.resolve()),
                             "addon": str(self.addon_path.resolve()),
+                            "process_group": True,
                             "started_at": time.time(),
                         },
                         ensure_ascii=False,
@@ -89,7 +91,11 @@ class ProxyManager:
         if not self.process:
             return
         if self.process.poll() is None:
-            result = terminate_owned_process(self.process.pid, _proxy_identity(self.addon_path))
+            result = terminate_owned_process(
+                self.process.pid,
+                _proxy_identity(self.addon_path),
+                process_group=True,
+            )
             if not result.get("ok", False):
                 return
         self.process = None
@@ -107,12 +113,28 @@ class ProxyManager:
         if not identity.get("ok", False):
             return identity
         pid = int(evidence["pid"])
-        if not _pid_exists(pid):
+        inspection = inspect_process(pid)
+        if inspection.status == "not_found":
             # Static home/port/addon ownership is sufficient once the recorded process no longer exists;
             # no signal is sent, so PID-reuse protection is not weakened.
             self.runtime_path.unlink(missing_ok=True)
             return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
-        result = terminate_owned_process(pid, _proxy_identity(self.addon_path))
+        if inspection.status == "inspection_failed":
+            return {
+                "ok": False,
+                "status": "inspection_failed",
+                "pid": pid,
+                "port": self.port,
+                "error": inspection.error,
+            }
+        process_identity = _proxy_identity(self.addon_path)
+        if not process_identity.matches(inspection.command):
+            return {"ok": False, "status": "ownership_mismatch", "pid": pid, "port": self.port}
+        result = terminate_owned_process(
+            pid,
+            process_identity,
+            process_group=evidence.get("process_group") is True,
+        )
         result.setdefault("port", self.port)
         if result.get("ok", False):
             self.runtime_path.unlink(missing_ok=True)
@@ -163,8 +185,19 @@ class ProxyManager:
         if not identity.get("ok", False):
             return identity
         pid = int(runtime["pid"])
+        inspection = inspect_process(pid)
+        if inspection.status == "inspection_failed":
+            return {
+                "ok": False,
+                "status": "inspection_failed",
+                "pid": pid,
+                "port": self.port,
+                "error": inspection.error,
+            }
+        if inspection.status == "not_found":
+            return {"ok": True, "status": "already_stopped", "pid": pid, "port": self.port}
         # PID reuse is possible after the original Runner exits, so command identity is mandatory before signaling.
-        if not _pid_matches_runtime(pid, self.addon_path):
+        if not _proxy_identity(self.addon_path).matches(inspection.command):
             return {"ok": False, "status": "ownership_mismatch", "pid": pid}
         return {"ok": True, "status": "owned", "pid": pid, "port": self.port}
 
@@ -198,14 +231,19 @@ def _is_port_open(port: int) -> bool:
 
 def _pid_matches_runtime(pid: int, addon_path: Path) -> bool:
     """Verify a retained PID still runs mitmdump with this project's exact addon path."""
-    return _proxy_identity(addon_path).matches(process_command(pid))
+    inspection = inspect_process(pid)
+    return inspection.status == "found" and _proxy_identity(addon_path).matches(inspection.command)
 
 
 def _pid_exists(pid: int) -> bool:
     """Return whether a PID still exists without sending a state-changing signal."""
-    return bool(process_command(int(pid)))
+    return inspect_process(int(pid)).status == "found"
 
 
 def _proxy_identity(addon_path: Path) -> ProcessIdentity:
     """Build the exact addon argv identity required before stopping a managed mitmdump."""
-    return ProcessIdentity("mitmdump", ("-s", str(addon_path.resolve())))
+    return ProcessIdentity(
+        "mitmdump",
+        ("-s", str(addon_path.resolve())),
+        launcher_executables=(Path(sys.executable).name,),
+    )

@@ -13,8 +13,8 @@ from typing import Any
 
 from mobile_auto_mcp.platform.processes import (
     ProcessIdentity,
+    inspect_process,
     popen_session_kwargs,
-    process_command,
     terminate_owned_process,
 )
 from mobile_auto_mcp.state.private_files import atomic_write_private_text, ensure_private_directory
@@ -51,7 +51,16 @@ class ReportServerManager:
                 stderr=subprocess.STDOUT,
                 **popen_session_kwargs(),
             )
-        self._write_state({"pid": process.pid, "host": self.host, "port": self.port, "report_root": str(self.report_root), "started_at": time.time()})
+        self._write_state(
+            {
+                "pid": process.pid,
+                "host": self.host,
+                "port": self.port,
+                "report_root": str(self.report_root),
+                "process_group": True,
+                "started_at": time.time(),
+            }
+        )
         deadline = time.time() + 3
         while time.time() < deadline:
             if process.poll() is not None:
@@ -84,37 +93,81 @@ class ReportServerManager:
         """Stop only the process recorded for this report root and remove stale state."""
         state = self._read_state()
         pid = int(state.get("pid") or 0)
-        owned = self._owns_process(pid, state)
+        if not self._static_identity_matches(state):
+            self.state_path.unlink(missing_ok=True)
+            return self._stop_result(pid, stopped=True, owned=False, ok=True)
+        inspection = inspect_process(pid)
+        if inspection.status == "inspection_failed":
+            return self._stop_result(
+                pid,
+                stopped=False,
+                owned=False,
+                ok=False,
+                error=inspection.error,
+            )
+        if inspection.status == "not_found":
+            self.state_path.unlink(missing_ok=True)
+            return self._stop_result(pid, stopped=True, owned=False, ok=True)
+        owned = _report_process_identity(self.report_root, self.host, self.port).matches(inspection.command)
         if owned:
             result = terminate_owned_process(
                 pid,
                 _report_process_identity(self.report_root, self.host, self.port),
+                process_group=state.get("process_group") is True,
             )
             exited = bool(result.get("ok", False))
         else:
             exited = True
         if exited:
             self.state_path.unlink(missing_ok=True)
-        return {
-            "ok": True,
-            "stopped": exited,
-            "pid": pid,
-            "report_root": str(self.report_root),
-            "ownership_verified": owned,
-        }
+        return self._stop_result(
+            pid,
+            stopped=exited,
+            owned=owned,
+            ok=bool(result.get("ok", False)) if owned else True,
+            error=str(result.get("error") or "") if owned else "",
+        )
 
     def _owns_process(self, pid: int, state: dict[str, Any]) -> bool:
         """Verify persisted metadata and the live command before trusting or terminating a PID."""
+        if not self._static_identity_matches(state):
+            return False
+        inspection = inspect_process(pid)
+        return (
+            inspection.status == "found"
+            and _report_process_identity(self.report_root, self.host, self.port).matches(inspection.command)
+        )
+
+    def _static_identity_matches(self, state: dict[str, Any]) -> bool:
+        """Validate persisted report root, port, and host without inspecting or signaling a PID."""
         try:
             state_root = Path(str(state.get("report_root") or "")).expanduser().resolve()
             state_port = int(state.get("port") or 0)
             state_host = str(state.get("host") or "")
         except (OSError, TypeError, ValueError):
             return False
-        if state_root != self.report_root or state_port != self.port or state_host != self.host:
-            return False
-        command = process_command(pid)
-        return _report_process_identity(self.report_root, self.host, self.port).matches(command)
+        return state_root == self.report_root and state_port == self.port and state_host == self.host
+
+    def _stop_result(
+        self,
+        pid: int,
+        *,
+        stopped: bool,
+        owned: bool,
+        ok: bool,
+        error: str = "",
+    ) -> dict[str, Any]:
+        """Build the stable report-stop response while exposing safe inspection failures."""
+        result: dict[str, Any] = {
+            "ok": ok,
+            "stopped": stopped,
+            "pid": pid,
+            "report_root": str(self.report_root),
+            "ownership_verified": owned,
+        }
+        if error:
+            result["error"] = error
+        return result
 
     def _port_ready(self, port: int | None = None) -> bool:
         """Probe the configured listener locally without relying on external network access."""

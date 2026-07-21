@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from mobile_auto_mcp.execution.runner import _retain_managed_environment, run_cases
+from mobile_auto_mcp.platform.processes import ProcessInspection
 from mobile_auto_mcp.proxy.device_proxy import DeviceProxyAdapter, ManagedProxyLease, ProxySnapshot
 from mobile_auto_mcp.proxy.proxy_manager import ProxyManager
 from mobile_auto_mcp.proxy import proxy_manager as proxy_manager_module
@@ -233,6 +234,26 @@ def test_recovery_record_survives_device_or_proxy_cleanup_failure(
     assert manager.load_pending() is not None
 
 
+def test_recovery_record_survives_process_inspection_failure(tmp_path: Path) -> None:
+    """Preserve phone snapshots when proxy ownership cannot be inspected safely."""
+    recovery_manager_type, _, _ = _load_recovery_contract()
+    manager = recovery_manager_type(tmp_path)
+    manager.persist("session-a", {"android": _snapshot().__dict__}, _runtime())
+
+    result = manager.restore_and_stop(
+        adapter_factory=lambda target, device_serial: _RecordingAdapter(),
+        proxy_stopper=lambda runtime: {
+            "ok": False,
+            "status": "inspection_failed",
+            "pid": runtime["pid"],
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["proxy"]["status"] == "inspection_failed"
+    assert manager.load_pending() is not None
+
+
 def test_workspace_run_lock_rejects_a_second_owner(tmp_path: Path) -> None:
     """验证同一 workspace 同时只允许一个 Runner 改写共享代理状态，避免 active/probe 文件互相覆盖。"""
     _, run_lock_type, busy_error_type = _load_recovery_contract()
@@ -278,7 +299,11 @@ def test_cleanup_accepts_an_owned_runtime_whose_process_already_exited(
     }
     manager.runtime_path.parent.mkdir(parents=True, exist_ok=True)
     manager.runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
-    monkeypatch.setattr(proxy_manager_module, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(
+        proxy_manager_module,
+        "inspect_process",
+        lambda pid: ProcessInspection(status="not_found"),
+    )
 
     result = manager.stop_owned_retained(runtime)
 
