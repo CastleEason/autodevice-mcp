@@ -132,7 +132,7 @@ def test_windows_adapter_accepts_a_competing_seed_writer(
     finally:
         os.close(descriptor)
 
-    assert backend.calls == [(descriptor, backend.LK_LOCK, 1, 1, 0)]
+    assert backend.calls == [(descriptor, backend.LK_NBLCK, 1, 1, 0)]
     assert lock_path.read_bytes() == b"\0"
 
 
@@ -167,7 +167,7 @@ def test_windows_blocking_lock_retries_past_msvcrt_retry_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retry contention indefinitely after more failures than one LK_LOCK call tolerates."""
+    """Retry blocking contention with non-blocking probes beyond msvcrt's built-in retry count."""
     backend = _FakeMsvcrt(contentions=12)
     descriptor = os.open(tmp_path / "blocking.lock", os.O_RDWR | os.O_CREAT, 0o600)
     monkeypatch.setattr(file_lock, "_IS_WINDOWS", True)
@@ -178,7 +178,7 @@ def test_windows_blocking_lock_retries_past_msvcrt_retry_limit(
         os.close(descriptor)
 
     assert len(backend.calls) == 13
-    assert {call[1] for call in backend.calls} == {backend.LK_LOCK}
+    assert {call[1] for call in backend.calls} == {backend.LK_NBLCK}
 
 
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.EDEADLK])

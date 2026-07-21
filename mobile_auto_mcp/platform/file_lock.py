@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import time
 from typing import Any
 
 
@@ -45,7 +46,7 @@ def unlock_file(descriptor: int) -> None:
 
 
 def _lock_windows(descriptor: int, *, blocking: bool) -> None:
-    """Lock byte zero, retrying Windows contention indefinitely for blocking callers."""
+    """Lock byte zero with short non-blocking probes for responsive blocking callers."""
     if _msvcrt is None:  # pragma: no cover - protected by the OS-specific import above.
         raise RuntimeError("Windows file-lock backend is unavailable")
     original_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
@@ -60,7 +61,7 @@ def _lock_windows(descriptor: int, *, blocking: bool) -> None:
                 # race, proceed to the normal lock loop instead of treating contention as I/O loss.
                 if not _is_contention(exc):
                     raise
-        mode = _msvcrt.LK_LOCK if blocking else _msvcrt.LK_NBLCK
+        mode = _msvcrt.LK_NBLCK
         while True:
             # Every retry repositions explicitly because msvcrt locks from the descriptor's current offset.
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -72,7 +73,9 @@ def _lock_windows(descriptor: int, *, blocking: bool) -> None:
                     raise
                 if not blocking:
                     raise BlockingIOError(exc.errno, exc.strerror) from exc
-                # LK_LOCK retries only for a bounded window internally; repeat until ownership is available.
+                # LK_LOCK sleeps for coarse one-second intervals. Short explicit backoff preserves
+                # blocking semantics without turning frequent state mutations into a lock convoy.
+                time.sleep(0.01)
                 continue
     finally:
         os.lseek(descriptor, original_offset, os.SEEK_SET)
