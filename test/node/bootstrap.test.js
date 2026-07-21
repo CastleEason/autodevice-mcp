@@ -88,11 +88,13 @@ function harness(fixture, overrides = {}) {
           await fs.mkdir(path.dirname(executable), { recursive: true });
           await fs.writeFile(executable, "managed fixture python");
         },
-        randomUUID: () => "fixture-id",
+        randomUUID: overrides.randomUUID ?? (() => "fixture-id"),
         sleep: async () => new Promise((resolve) => setTimeout(resolve, 5)),
         now: overrides.now,
         processId: overrides.processId,
         isProcessAlive: overrides.isProcessAlive,
+        setInterval: overrides.setInterval,
+        clearInterval: overrides.clearInterval,
       },
     },
     calls,
@@ -270,6 +272,103 @@ test("lock initialization reports cleanup failure instead of silently stranding 
         && error.message.includes("owner write failed")
         && error.message.includes("abandon rename failed"),
     );
+  });
+});
+
+test("a reclaimed owner cannot heartbeat or publish through its replacement lease", async () => {
+  await withFixture(async (fixture) => {
+    const scheduledHeartbeats = [];
+    const scheduleHeartbeat = (callback) => {
+      scheduledHeartbeats.push(callback);
+      return { unref() {} };
+    };
+    const clearHeartbeat = () => {};
+
+    let resumeA;
+    let resumeB;
+    let markAStarted;
+    let markBStarted;
+    const aStarted = new Promise((resolve) => { markAStarted = resolve; });
+    const bStarted = new Promise((resolve) => { markBStarted = resolve; });
+    const aBlocked = new Promise((resolve) => { resumeA = resolve; });
+    const bBlocked = new Promise((resolve) => { resumeB = resolve; });
+    const clock = { now: Date.now() };
+    const sequence = (values) => () => {
+      assert.ok(values.length > 0, "random UUID sequence exhausted");
+      return values.shift();
+    };
+    const ownerA = harness(fixture, {
+      processId: 101,
+      now: () => clock.now,
+      randomUUID: sequence(["owner-a", "generation-a"]),
+      setInterval: scheduleHeartbeat,
+      clearInterval: clearHeartbeat,
+      installDelay: async () => {
+        markAStarted();
+        await aBlocked;
+      },
+    });
+    const ownerB = harness(fixture, {
+      processId: 202,
+      now: () => clock.now,
+      randomUUID: sequence(["quarantine-a", "owner-b", "generation-b"]),
+      setInterval: scheduleHeartbeat,
+      clearInterval: clearHeartbeat,
+      installDelay: async () => {
+        markBStarted();
+        await bBlocked;
+      },
+    });
+    ownerA.options.lockStaleMs = 1_000;
+    ownerB.options.lockStaleMs = 1_000;
+    ownerA.options.lockTimeoutMs = 100;
+    ownerB.options.lockTimeoutMs = 100;
+
+    const root = path.join(fixture.cacheHome, "0.3.0", "darwin-arm64");
+    const lock = `${root}.lock`;
+    const ownerPath = path.join(lock, "owner.json");
+    let aPromise;
+    let bPromise;
+    try {
+      aPromise = ensureRuntime(ownerA.options);
+      await aStarted;
+      clock.now += 5_000;
+
+      bPromise = ensureRuntime(ownerB.options);
+      await bStarted;
+      assert.equal(scheduledHeartbeats.length, 2);
+      const beforeHeartbeat = {
+        contents: await fs.readFile(ownerPath, "utf8"),
+        mtimeMs: (await fs.stat(ownerPath)).mtimeMs,
+      };
+      assert.equal(JSON.parse(beforeHeartbeat.contents).token, "owner-b");
+
+      clock.now += 500;
+      await scheduledHeartbeats[0]();
+      await new Promise((resolve) => setImmediate(resolve));
+      const afterHeartbeat = {
+        contents: await fs.readFile(ownerPath, "utf8"),
+        mtimeMs: (await fs.stat(ownerPath)).mtimeMs,
+      };
+      assert.deepEqual(afterHeartbeat, beforeHeartbeat);
+
+      resumeA();
+      await assert.rejects(aPromise, { code: "runtime_lock_lost" });
+      await assert.rejects(fs.stat(root), { code: "ENOENT" });
+      assert.deepEqual(await fs.readFile(ownerPath, "utf8"), beforeHeartbeat.contents);
+      assert.ok((await fs.stat(`${root}.tmp-generation-b`)).isDirectory());
+      await assert.rejects(fs.stat(`${root}.tmp-generation-a`), { code: "ENOENT" });
+
+      resumeB();
+      const runtime = await bPromise;
+      assert.equal(runtime.root, root);
+      assert.equal(ownerA.installs, 1);
+      assert.equal(ownerB.installs, 1);
+    } finally {
+      resumeA?.();
+      resumeB?.();
+      await Promise.allSettled([aPromise, bPromise].filter(Boolean));
+    }
   });
 });
 
