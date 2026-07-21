@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mobile-auto-mcp"
-version = "0.2.0"
+name = "autodevice-mcp"
+version = "0.3.0"
 description = "MCP server for auditable abnormal API-response testing on Android, iOS, and HarmonyOS devices."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,7 +36,7 @@ dev = [
 ]
 
 [project.scripts]
-mobile-auto-mcp = "mobile_auto_mcp.server:main"
+autodevice-mcp = "mobile_auto_mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["mobile_auto_mcp*"]

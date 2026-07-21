@@ -15,7 +15,7 @@ from mobile_auto_mcp.mcp_tools import register_all_tools  # noqa: E402
 
 
 mcp = FastMCP(
-    "mobile-auto-mcp",
+    "autodevice-mcp",
     instructions=(
         "独立移动端异常场景执行 MCP：导入用例、启动代理、操作设备、截图并生成报告。"
         "需要进入目标页时必须先启动代理，再启动 App，再执行 UI 导航；UI 点击会先读取当前元素并解析候选，"

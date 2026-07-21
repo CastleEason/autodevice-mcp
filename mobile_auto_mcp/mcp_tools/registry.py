@@ -106,7 +106,7 @@ def register_all_tools(mcp: Any) -> None:
     def runtime_status(proxy_port: int = 13000, wda_url: str = "") -> dict[str, Any]:
         """Return read-only MCP, proxy, WDA, and device runtime status."""
         try:
-            version = importlib.metadata.version("mobile-auto-mcp")
+            version = importlib.metadata.version("autodevice-mcp")
         except importlib.metadata.PackageNotFoundError:
             version = "source"
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
