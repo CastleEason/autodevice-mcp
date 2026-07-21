@@ -29,6 +29,23 @@ async function withTempFile(run) {
   }
 }
 
+function fileSystemWithWrappedWrites(wrapWrite) {
+  return {
+    ...fs,
+    open: async (...args) => {
+      const handle = await fs.open(...args);
+      return {
+        write: wrapWrite.bind(null, handle),
+        read: handle.read.bind(handle),
+        stat: handle.stat.bind(handle),
+        sync: handle.sync.bind(handle),
+        chmod: handle.chmod.bind(handle),
+        close: handle.close.bind(handle),
+      };
+    },
+  };
+}
+
 test("streams a verified artifact into a mode 0600 destination", async () => {
   await withTempFile(async (file) => {
     const content = Buffer.from("verified-runtime");
@@ -42,6 +59,51 @@ test("streams a verified artifact into a mode 0600 destination", async () => {
     assert.deepEqual(await fs.readFile(file), content);
     assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
     assert.deepEqual(await fs.readdir(path.dirname(file)), [path.basename(file)]);
+  });
+});
+
+test("retries short file writes until the entire chunk is persisted", async () => {
+  await withTempFile(async (file) => {
+    const content = Buffer.from("short-write-runtime");
+    let writeCalls = 0;
+    const fileSystem = fileSystemWithWrappedWrites(
+      (handle, buffer, offset = 0, length = buffer.length - offset, position = null) => {
+        writeCalls += 1;
+        return handle.write(buffer, offset, Math.min(length, 2), position);
+      },
+    );
+
+    await downloadVerified(assetFor(content), file, {
+      fs: fileSystem,
+      request: async () => response([content]),
+      randomUUID: () => "fixed",
+    });
+
+    assert.deepEqual(await fs.readFile(file), content);
+    assert.ok(writeCalls > 1);
+  });
+});
+
+test("verifies the persisted temporary file before publishing it", async () => {
+  await withTempFile(async (file) => {
+    const content = Buffer.from("persisted-runtime");
+    const fileSystem = fileSystemWithWrappedWrites(
+      (handle, buffer, offset = 0, length = buffer.length - offset, position = null) => {
+        const corrupted = Buffer.from(buffer.subarray(offset, offset + length));
+        corrupted[0] ^= 0xff;
+        return handle.write(corrupted, 0, corrupted.length, position);
+      },
+    );
+
+    await assert.rejects(
+      () => downloadVerified(assetFor(content), file, {
+        fs: fileSystem,
+        request: async () => response([content]),
+        randomUUID: () => "fixed",
+      }),
+      { code: "runtime_checksum_mismatch" },
+    );
+    assert.deepEqual(await fs.readdir(path.dirname(file)), []);
   });
 });
 
@@ -96,6 +158,58 @@ test("rejects redirects to hosts outside the download allowlist", async () => {
       { code: "runtime_download_failed" },
     );
     assert.equal(requests, 1);
+  });
+});
+
+test("rejects an HTTPS redirect that downgrades to HTTP", async () => {
+  await withTempFile(async (file) => {
+    let requests = 0;
+    await assert.rejects(
+      () => downloadVerified(assetFor(Buffer.from("runtime")), file, {
+        request: async () => {
+          requests += 1;
+          return response([], {
+            statusCode: 302,
+            headers: { location: "http://github.com/runtime.tar.gz" },
+          });
+        },
+        randomUUID: () => "fixed",
+      }),
+      { code: "runtime_download_failed" },
+    );
+    assert.equal(requests, 1);
+  });
+});
+
+test("rejects a redirect without a Location header", async () => {
+  await withTempFile(async (file) => {
+    await assert.rejects(
+      () => downloadVerified(assetFor(Buffer.from("runtime")), file, {
+        request: async () => response([], { statusCode: 302 }),
+        randomUUID: () => "fixed",
+      }),
+      { code: "runtime_download_failed" },
+    );
+  });
+});
+
+test("stops after the bounded redirect limit", async () => {
+  await withTempFile(async (file) => {
+    let requests = 0;
+    await assert.rejects(
+      () => downloadVerified(assetFor(Buffer.from("runtime")), file, {
+        request: async () => {
+          requests += 1;
+          return response([], {
+            statusCode: 302,
+            headers: { location: "https://github.com/runtime.tar.gz" },
+          });
+        },
+        randomUUID: () => "fixed",
+      }),
+      { code: "runtime_download_failed" },
+    );
+    assert.equal(requests, 6);
   });
 });
 
