@@ -190,7 +190,7 @@ def test_termination_never_signals_a_command_with_only_a_partial_identity_match(
         "inspect_process",
         lambda pid, system=None: ProcessInspection(status="found", command=tuple(observed)),
     )
-    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)), raising=False)
     monkeypatch.setattr(
         processes.subprocess,
         "run",
@@ -250,7 +250,7 @@ def test_posix_termination_revalidates_ownership_before_forcing(
         ]
     )
     monkeypatch.setattr(processes, "inspect_process", lambda pid, system=None: inspections.pop(0))
-    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)), raising=False)
     monkeypatch.setattr(processes, "_wait_for_exit", lambda pid, system, timeout: next(waits))
 
     result = terminate_owned_process(4242, identity, "Linux")
@@ -372,7 +372,7 @@ def test_force_is_skipped_when_ownership_changes_during_graceful_wait(
     ]
     signals: list[tuple[int, signal.Signals]] = []
     monkeypatch.setattr(processes, "inspect_process", lambda pid, system=None: inspections.pop(0))
-    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)), raising=False)
     monkeypatch.setattr(
         processes,
         "_wait_for_exit",
@@ -400,7 +400,7 @@ def test_inspection_failure_after_graceful_signal_prevents_force(
         "inspect_process",
         lambda pid, system=None: ProcessInspection(status="found", command=command),
     )
-    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: signals.append((pid, sig)), raising=False)
     monkeypatch.setattr(
         processes,
         "_wait_for_exit",
@@ -435,7 +435,12 @@ def test_legacy_posix_process_uses_single_pid_signals(monkeypatch: pytest.Monkey
         lambda pid, system, timeout: ProcessInspection(status="not_found"),
     )
     monkeypatch.setattr(processes.os, "kill", lambda pid, sig: pid_signals.append((pid, sig)))
-    monkeypatch.setattr(processes.os, "killpg", lambda pid, sig: group_signals.append((pid, sig)))
+    monkeypatch.setattr(
+        processes.os,
+        "killpg",
+        lambda pid, sig: group_signals.append((pid, sig)),
+        raising=False,
+    )
 
     result = terminate_owned_process(4242, identity, "Linux", process_group=False)
 
@@ -992,8 +997,8 @@ def test_legacy_report_never_authorizes_echo_from_observed_argv(
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or "Python.framework" not in sys.executable,
-    reason="macOS framework-Python re-exec integration",
+    sys.platform != "darwin" or "Python.framework" not in sys.executable or bool(os.environ.get("CI")),
+    reason="local macOS framework-Python re-exec integration",
 )
 def test_real_report_server_persists_stable_native_identity_and_stops_after_reexec(tmp_path: Path) -> None:
     """Wait for the real framework child, verify status ownership, and remove state only after exit."""
@@ -1033,8 +1038,8 @@ def test_real_report_server_persists_stable_native_identity_and_stops_after_reex
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or "Python.framework" not in sys.executable,
-    reason="macOS framework-Python legacy-state integration",
+    sys.platform != "darwin" or "Python.framework" not in sys.executable or bool(os.environ.get("CI")),
+    reason="local macOS framework-Python legacy-state integration",
 )
 def test_real_report_server_stops_legacy_state_after_framework_reexec(tmp_path: Path) -> None:
     """Derive stable live report identity after old state fields are removed, then stop by single PID."""

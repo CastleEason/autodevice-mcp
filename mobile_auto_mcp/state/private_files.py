@@ -7,6 +7,13 @@ import tempfile
 from pathlib import Path
 
 
+def _set_private_descriptor_mode(descriptor: int) -> None:
+    """Apply owner-only POSIX permissions when the host exposes descriptor chmod."""
+    fchmod = getattr(os, "fchmod", None)
+    if callable(fchmod):
+        fchmod(descriptor, 0o600)
+
+
 def ensure_private_directory(path: str | Path) -> Path:
     """Create a directory tree and force the requested leaf to owner-only access."""
     directory = Path(path).expanduser()
@@ -22,7 +29,7 @@ def atomic_write_private_text(path: str | Path, text: str) -> Path:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
@@ -45,7 +52,7 @@ def append_private_text(path: str | Path, text: str) -> Path:
     ensure_private_directory(destination.parent)
     descriptor = os.open(destination, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
