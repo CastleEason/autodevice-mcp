@@ -256,7 +256,7 @@ def test_posix_termination_revalidates_ownership_before_forcing(
     result = terminate_owned_process(4242, identity, "Linux")
 
     assert result == {"ok": True, "status": "stopped", "pid": 4242, "forced": True}
-    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+    assert signals == [(4242, signal.SIGTERM), (4242, getattr(signal, "SIGKILL", 9))]
 
 
 def test_windows_termination_uses_taskkill_and_adds_force_only_after_timeout(

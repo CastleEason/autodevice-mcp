@@ -19,6 +19,8 @@ from typing import Any, Callable, Literal
 
 
 _WINDOWS_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
+_POSIX_SIGTERM = getattr(signal, "SIGTERM", 15)
 _InspectionStatus = Literal["found", "not_found", "inspection_failed"]
 
 
@@ -405,9 +407,9 @@ def _signal_process(
                     "error": str(completed.stderr or completed.stdout or "taskkill failed").strip(),
                 }
         elif process_group:
-            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+            os.killpg(pid, _POSIX_SIGKILL if force else _POSIX_SIGTERM)
         else:
-            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+            os.kill(pid, _POSIX_SIGKILL if force else _POSIX_SIGTERM)
     except ProcessLookupError:
         return None
     except (OSError, subprocess.SubprocessError) as exc:

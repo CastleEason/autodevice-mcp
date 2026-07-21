@@ -53,7 +53,13 @@ def _lock_windows(descriptor: int, *, blocking: bool) -> None:
         if os.fstat(descriptor).st_size == 0:
             # msvcrt cannot lock beyond EOF, so reserve byte zero before the first acquisition.
             os.lseek(descriptor, 0, os.SEEK_SET)
-            os.write(descriptor, b"\0")
+            try:
+                os.write(descriptor, b"\0")
+            except OSError as exc:
+                # A concurrent creator can seed and lock byte zero after the size check. In that
+                # race, proceed to the normal lock loop instead of treating contention as I/O loss.
+                if not _is_contention(exc):
+                    raise
         mode = _msvcrt.LK_LOCK if blocking else _msvcrt.LK_NBLCK
         while True:
             # Every retry repositions explicitly because msvcrt locks from the descriptor's current offset.

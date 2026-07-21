@@ -109,6 +109,33 @@ def test_windows_adapter_seeds_empty_file_and_locks_byte_zero(
     assert lock_path.read_bytes() == b"\0"
 
 
+def test_windows_adapter_accepts_a_competing_seed_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Continue to byte locking when another process wins the empty-file seed race."""
+    backend = _FakeMsvcrt()
+    lock_path = tmp_path / "competing-seed.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    original_write = os.write
+
+    def competing_write(target: int, payload: bytes) -> int:
+        """Model another process seeding and locking byte zero before this writer."""
+        original_write(target, payload)
+        raise PermissionError(errno.EACCES, "byte zero already locked")
+
+    monkeypatch.setattr(file_lock, "_IS_WINDOWS", True)
+    monkeypatch.setattr(file_lock, "_msvcrt", backend)
+    monkeypatch.setattr(file_lock.os, "write", competing_write)
+    try:
+        lock_file(descriptor, blocking=True)
+    finally:
+        os.close(descriptor)
+
+    assert backend.calls == [(descriptor, backend.LK_LOCK, 1, 1, 0)]
+    assert lock_path.read_bytes() == b"\0"
+
+
 def test_windows_lock_uses_byte_zero_and_restores_nonzero_offset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
