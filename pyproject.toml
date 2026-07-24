@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autodevice-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "MCP server for auditable abnormal API-response testing on Android, iOS, and HarmonyOS devices."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -45,3 +45,6 @@ include = ["mobile_auto_mcp*"]
 markers = [
   "real_device: opt-in tests that mutate authorized physical test devices and require explicit environment configuration",
 ]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

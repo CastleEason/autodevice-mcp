@@ -1,6 +1,6 @@
 {
   "name": "autodevice-mcp",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Auditable mobile abnormal-response testing MCP for Android, iOS, and HarmonyOS",
   "license": "Apache-2.0",
   "type": "commonjs",

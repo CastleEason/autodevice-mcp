@@ -4,6 +4,10 @@ All notable changes are documented in this file.
 
 The project follows semantic versioning after the initial `0.x` development series.
 
+## 0.3.2
+
+- Made the established Ruff lint policy explicit so dependency updates cannot silently expand the release gate.
+
 ## 0.3.1
 
 - Replaced Android global HTTP proxy writes with semantic configuration and verification of the currently connected Wi-Fi network.
