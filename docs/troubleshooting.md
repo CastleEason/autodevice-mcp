@@ -16,6 +16,12 @@ Verify the page anchor, request-trigger path, API matcher, and fresh client-IP p
 
 Check that the device is unlocked, trusted, connected, and running the expected signed WebDriverAgent. Normal execution does not reinstall or re-sign WDA. Use `repair_wda` only when that action is explicitly authorized.
 
+Use the returned readiness stage to narrow the failure: `transport` means `/status` is unreachable, `status` means WDA did not declare itself ready, `session` means XCTest could not create a session, and `command` means the session could not complete the read-only window-size probe. The Runner does not create the navigation driver until all stages pass.
+
+## Android proxy affects every network
+
+Current releases never write Android global HTTP proxy settings. A formal run opens `android.settings.WIFI_SETTINGS`, identifies the connected SSID, edits that Wi-Fi network through semantic system labels, and verifies the visible host and port. If the current network or editable proxy controls cannot be identified, the run stops without falling back to a global proxy.
+
 ## Report says evidence is incomplete
 
 Inspect `manifest.json` for issue codes, then correlate `execution_events.jsonl`, `mitmproxy_events.jsonl`, `trace.json`, and `modified_responses.json` by Session, lane, rule, and activation identifier.

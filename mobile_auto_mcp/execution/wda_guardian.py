@@ -11,7 +11,11 @@ import tempfile
 import time
 from typing import Any
 
-from mobile_auto_mcp.execution.devices import DEFAULT_WDA_URL, IOSWDAClient, WDAConnectionError
+from mobile_auto_mcp.execution.adapters.ios import (
+    DEFAULT_WDA_URL,
+    probe_wda_readiness,
+    probe_wda_transport,
+)
 
 
 DEFAULT_WDA_PROCESS_PATTERN = "xcodebuild .*WebDriverAgentRunner|WebDriverAgentRunner-Runner"
@@ -213,11 +217,8 @@ def wda_setup_hint(wda_url: str) -> str:
 
 
 def _wda_status(wda_url: str) -> dict[str, Any]:
-    """Handle wda status using the supplied state and inputs."""
-    try:
-        return {"ok": True, "status": IOSWDAClient(wda_url).status()}
-    except WDAConnectionError as exc:
-        return {"ok": False, "error": str(exc)}
+    """Return strong WDA execution readiness for startup and preflight decisions."""
+    return probe_wda_readiness(wda_url)
 
 
 def resolve_wda_start_command(command: str = "", *, device_serial: str = "") -> str:
@@ -285,7 +286,7 @@ def run_wda_keepalive(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     while True:
-        if _wda_status(wda_url.rstrip("/")).get("ok"):
+        if probe_wda_transport(wda_url.rstrip("/")).get("ok"):
             time.sleep(interval)
             continue
 

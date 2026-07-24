@@ -108,12 +108,18 @@ def run_preflight(
             checks["android_devices"] = _adb_devices()
             if not checks["android_devices"]:
                 blockers.append("未发现 Android 设备")
-            checks["android_proxy"] = read_android_proxy(device_serial=device_serial)
             if proxy_required and require_android_proxy_match:
+                checks["android_proxy"] = read_android_proxy(device_serial=device_serial)
                 ok, message = _android_proxy_matches(checks["android_proxy"], expected_port)
                 checks["android_proxy_match"] = ok
                 if not ok:
                     blockers.append(message)
+            else:
+                checks["android_proxy"] = {
+                    "ok": None,
+                    "deferred": True,
+                    "message": "正式执行将在创建可恢复快照后，通过当前 Wi-Fi 系统设置页托管并复核代理",
+                }
     elif normalized == "ios":
         # WDA modules stay behind the macOS capability gate so unsupported hosts can start the MCP.
         from mobile_auto_mcp.execution.adapters.ios import DEFAULT_WDA_URL
@@ -208,29 +214,22 @@ def run_preflight(
 
 
 def read_android_proxy(device_serial: str = "") -> dict[str, Any]:
-    """Read Android proxy settings through adb only; never set/delete values."""
-    proxy = {
-        "http_proxy": _adb_shell(["settings", "get", "global", "http_proxy"], device_serial),
-        "global_http_proxy_host": _adb_shell(["settings", "get", "global", "global_http_proxy_host"], device_serial),
-        "global_http_proxy_port": _adb_shell(["settings", "get", "global", "global_http_proxy_port"], device_serial),
-    }
-    return proxy
+    """Read the connected Android Wi-Fi proxy through system Settings without global keys."""
+    from mobile_auto_mcp.execution.devices import DeviceDriver
+
+    return DeviceDriver(target="android", device_serial=device_serial).read_system_proxy()
 
 
 def _android_proxy_matches(proxy: dict[str, Any], expected_port: int) -> tuple[bool, str]:
-    """Handle android proxy matches using the supplied state and inputs."""
-    http_proxy = str(proxy.get("http_proxy") or "").strip()
-    port = str(proxy.get("global_http_proxy_port") or "").strip()
-    if http_proxy and http_proxy.lower() != "null" and ":" in http_proxy:
-        actual_port = http_proxy.rsplit(":", 1)[-1]
-        if actual_port == str(expected_port):
-            return True, ""
-        return False, f"Android WLAN 代理端口为 {actual_port}，与期望端口 {expected_port} 不一致，请手动调整后重跑"
-    if port and port.lower() != "null":
-        if port == str(expected_port):
-            return True, ""
-        return False, f"Android WLAN 代理端口为 {port}，与期望端口 {expected_port} 不一致，请手动调整后重跑"
-    return False, f"未识别到 Android WLAN 代理端口，请手动设置为本机 IP:{expected_port} 后重跑"
+    """Require verified current-Wi-Fi manual proxy evidence, never a global setting."""
+    if not proxy.get("ok"):
+        return False, str(proxy.get("message") or "未能读取 Android 当前 Wi-Fi 代理，禁止继续")
+    if str(proxy.get("mode") or "").lower() != "manual":
+        return False, f"Android 当前 Wi-Fi 未启用手动代理，请设置为本机 IP:{expected_port} 后重跑"
+    actual_port = int(proxy.get("port") or 0)
+    if actual_port == int(expected_port):
+        return True, ""
+    return False, f"Android 当前 Wi-Fi 代理端口为 {actual_port or '未识别'}，与期望端口 {expected_port} 不一致"
 
 
 def _adb_devices() -> list[str]:
@@ -366,13 +365,10 @@ def _local_ip_candidates() -> list[str]:
 
 
 def _wda_status(wda_url: str) -> dict[str, Any]:
-    """Probe WDA lazily after the host capability gate accepts the iOS lane."""
-    from mobile_auto_mcp.execution.adapters.ios import IOSWDAClient, WDAConnectionError
+    """Require strong WDA execution readiness after the macOS capability gate."""
+    from mobile_auto_mcp.execution.adapters.ios import probe_wda_readiness
 
-    try:
-        return {"ok": True, "status": IOSWDAClient(wda_url).status()}
-    except WDAConnectionError as exc:
-        return {"ok": False, "error": str(exc)}
+    return probe_wda_readiness(wda_url)
 
 
 

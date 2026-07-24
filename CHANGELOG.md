@@ -4,6 +4,12 @@ All notable changes are documented in this file.
 
 The project follows semantic versioning after the initial `0.x` development series.
 
+## 0.3.1
+
+- Replaced Android global HTTP proxy writes with semantic configuration and verification of the currently connected Wi-Fi network.
+- Added a hard iOS WDA readiness gate covering `/status`, session creation, and a read-only window-size command before any navigation starts.
+- Added regression coverage for Android Wi-Fi proxy navigation, WDA trust failures, and runner blocking after failed iOS readiness.
+
 ## 0.2.0
 
 - Added pre-device execution-contract gates for rules, exact APIs, mutation assets, requested IDs, and page anchors.

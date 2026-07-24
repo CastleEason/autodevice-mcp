@@ -88,12 +88,14 @@ class DeviceDriver:
                     )
                     if not self.wda_guardian_result.get("ok"):
                         raise WDAConnectionError(str(self.wda_guardian_result.get("error") or self.wda_guardian_result))
-                self._device = IOSWDAClient(
+                client = IOSWDAClient(
                     self.wda_url,
                     device_udid=self.device_serial,
                     tap_backend=self.ios_tap_backend,
                     tap_command=self.ios_tap_command,
                 )
+                client.verify_readiness()
+                self._device = client
             return self._device
         if self.target == "harmony":
             if self._device is None:
@@ -284,8 +286,8 @@ class DeviceDriver:
 
     def read_system_proxy(self) -> dict[str, Any]:
         """Open current Wi-Fi proxy settings semantically and read mode plus visible field values."""
-        if self.target not in {"ios", "harmony"}:
-            return {"ok": False, "message": "Android 系统代理由 ADB 适配器读取"}
+        if self.target not in {"android", "ios", "harmony"}:
+            return {"ok": False, "message": f"{self.target} 不支持系统 Wi-Fi 代理读取"}
         opened = self._open_system_proxy_settings()
         if not opened.get("ok"):
             return opened
@@ -314,8 +316,19 @@ class DeviceDriver:
 
     def read_wifi_network_info(self) -> dict[str, Any]:
         """Read the selected device's Wi-Fi IPv4 address from its semantic settings details page."""
+        if self.target == "android":
+            output = str(self._adb(["shell", "ip", "-o", "-4", "addr", "show", "wlan0"], check=False) or "")
+            match = re.search(r"\binet\s+(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b", output)
+            if not match:
+                return {"ok": False, "message": "ADB 未识别 Android 当前 Wi-Fi IPv4 地址", "source": "adb_wlan0"}
+            return {
+                "ok": True,
+                "target": self.target,
+                "device_ip": match.group(1),
+                "source": "adb_wlan0",
+            }
         if self.target not in {"ios", "harmony"}:
-            return {"ok": False, "message": "Android Wi-Fi 地址由设备级 ADB 命令读取"}
+            return {"ok": False, "message": f"{self.target} 不支持 Wi-Fi 地址读取"}
         opened = self._open_wifi_details()
         if not opened.get("ok"):
             return opened
@@ -376,10 +389,10 @@ class DeviceDriver:
             url_result = self.input_text(auto_config_url, locator={"bounds": fields[0].get("bounds")}, clear=True)
             if not url_result.get("ok"):
                 return {"ok": False, "message": "自动代理 URL 写入失败", "url": url_result}
-        if self.target == "harmony":
+        if self.target in {"android", "harmony"}:
             save = self.resolve_and_click({"any_text": ["保存", "Save", "确定", "OK"], "target_description": "save proxy settings"})
             if not save.get("ok"):
-                return {"ok": False, "message": "HarmonyOS 代理设置未找到保存操作", "save": save}
+                return {"ok": False, "message": f"{self.target} 代理设置未找到保存操作", "save": save}
         else:
             self.back()
         return {"ok": True, "target": self.target, "mode": normalized, "host": host, "port": int(port or 0)}
@@ -389,6 +402,41 @@ class DeviceDriver:
         details = self._open_wifi_details()
         if not details.get("ok"):
             return details
+        if self.target == "android":
+            elements = self.list_elements(limit=self.locator_tree_limit)
+            if not _android_proxy_editor_visible(elements):
+                edit = self.resolve_and_click(
+                    {
+                        "any_text": ["编辑", "修改网络", "管理网络", "Edit", "Modify network", "Manage network"],
+                        "target_description": "edit current Wi-Fi network",
+                    }
+                )
+                if edit.get("ok"):
+                    elements = self.list_elements(limit=self.locator_tree_limit)
+                advanced, _ = _select_element(
+                    elements,
+                    {"any_text": ["高级选项", "高级设置", "Advanced options", "Advanced settings"]},
+                )
+                if advanced:
+                    self.resolve_and_click(
+                        {"bounds": advanced.get("bounds"), "target_description": "advanced Wi-Fi options"}
+                    )
+                    elements = self.list_elements(limit=self.locator_tree_limit)
+                if not _android_proxy_editor_visible(elements):
+                    proxy = self.resolve_and_click(
+                        {
+                            "any_text": ["代理", "代理设置", "Proxy", "Proxy settings"],
+                            "target_description": "current Wi-Fi proxy mode",
+                        }
+                    )
+                    if not proxy.get("ok"):
+                        return {
+                            "ok": False,
+                            "message": "无法在当前 Android Wi-Fi 编辑页找到代理设置",
+                            "proxy": proxy,
+                            "details": details,
+                        }
+                return {**details, "proxy": {"ok": True, "strategy": "android_wifi_edit"}}
         proxy = self.resolve_and_click(
             {"any_text": ["配置代理", "Configure Proxy", "HTTP 代理", "HTTP Proxy", "代理"], "target_description": "HTTP proxy settings"}
         )
@@ -398,6 +446,51 @@ class DeviceDriver:
 
     def _open_wifi_details(self) -> dict[str, Any]:
         """Navigate only to the connected Wi-Fi details page so address proof and proxy edits share one safe seam."""
+        if self.target == "android":
+            self._adb(
+                ["shell", "am", "start", "-a", "android.settings.WIFI_SETTINGS"],
+                check=False,
+            )
+            time.sleep(0.5)
+            elements = self.list_elements(limit=self.locator_tree_limit)
+            connected = next(
+                (
+                    item
+                    for item in elements
+                    if item.get("selected")
+                    and item.get("enabled", True)
+                    and str(item.get("text") or "").strip()
+                ),
+                None,
+            )
+            ssid = str((connected or {}).get("text") or "").strip()
+            if not connected:
+                ssid = self._android_connected_ssid()
+                connected, _ = _select_element(elements, {"text": ssid}) if ssid else (None, [])
+            if not connected:
+                connected, _ = _select_element(
+                    elements,
+                    {"any_text": ["已连接", "Connected", "当前网络", "Current network"]},
+                )
+                ssid = str((connected or {}).get("text") or "").strip()
+            if not connected:
+                return {
+                    "ok": False,
+                    "message": "无法识别 Android 当前已连接 Wi-Fi；未修改任何代理设置",
+                    "settings_action": "android.settings.WIFI_SETTINGS",
+                    "elements": elements[:20],
+                }
+            detail_click = self.resolve_and_click(
+                {"bounds": connected.get("bounds"), "target_description": "connected Android Wi-Fi details"}
+            )
+            if not detail_click.get("ok"):
+                return {"ok": False, "message": "无法打开 Android 当前 Wi-Fi 详情", "detail": detail_click}
+            return {
+                "ok": True,
+                "ssid": ssid,
+                "settings_action": "android.settings.WIFI_SETTINGS",
+                "detail": detail_click,
+            }
         bundle = "com.apple.Preferences" if self.target == "ios" else "com.huawei.hmos.settings/MainAbility"
         launched = self.launch_app(bundle, wait_seconds=1)
         wifi = self.resolve_and_click({"any_text": ["无线局域网", "Wi-Fi", "WLAN"], "target_description": "system Wi-Fi settings"})
@@ -426,6 +519,21 @@ class DeviceDriver:
         if not detail_click.get("ok"):
             return {"ok": False, "message": "无法打开当前 Wi-Fi 详情", "detail": detail_click}
         return {"ok": True, "ssid": ssid, "launch": launched, "wifi": wifi, "detail": detail_click}
+
+    def _android_connected_ssid(self) -> str:
+        """Read only the connected Android SSID to select the matching current-network row."""
+        for command in (["shell", "cmd", "wifi", "status"], ["shell", "dumpsys", "wifi"]):
+            output = str(self._adb(command, check=False) or "")
+            for pattern in (
+                r'(?im)^\s*SSID\s*:\s*"?(?P<ssid>[^",\r\n]+)',
+                r'(?i)\bSSID[=:]\s*"(?P<ssid>[^"]+)"',
+            ):
+                match = re.search(pattern, output)
+                if match:
+                    value = match.group("ssid").strip()
+                    if value and value.lower() not in {"<unknown ssid>", "unknown"}:
+                        return value
+        return ""
 
     def swipe(
         self,
@@ -1189,7 +1297,26 @@ def _selected_proxy_mode(elements: list[dict[str, Any]]) -> str:
         for mode, options in labels.items():
             if text in options:
                 return mode
+    # Android's Settings spinner often exposes only the current value without selected=true.
+    for element in elements:
+        text = str(element.get("text") or "").strip()
+        for mode, options in labels.items():
+            if text in options and element.get("enabled", True):
+                return mode
     return ""
+
+
+def _android_proxy_editor_visible(elements: list[dict[str, Any]]) -> bool:
+    """Distinguish Android's editable proxy controls from a read-only details summary."""
+    if _proxy_text_fields(elements):
+        return True
+    labels = {"关闭", "无", "Off", "None", "手动", "Manual", "自动", "Auto", "Automatic"}
+    visible_modes = {
+        str(item.get("text") or "").strip()
+        for item in elements
+        if str(item.get("text") or "").strip() in labels and item.get("enabled", True)
+    }
+    return len(visible_modes) >= 2
 
 
 def _proxy_text_fields(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1268,17 +1395,6 @@ def _bounds_center(bounds: str) -> tuple[int | None, int | None]:
 
 
 
-
-
-
-
-
 def _env_truthy(name: str) -> bool:
     """Return whether an environment variable contains a truthy value."""
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-
-
-
-

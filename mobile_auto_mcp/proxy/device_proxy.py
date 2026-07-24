@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
@@ -53,103 +51,8 @@ class DeviceProxyAdapter:
         raise NotImplementedError
 
 
-class AndroidProxyAdapter(DeviceProxyAdapter):
-    """Manage Android global HTTP proxy settings through ADB with exact restoration."""
-
-    _KEYS = (
-        "http_proxy",
-        "global_http_proxy_host",
-        "global_http_proxy_port",
-        "global_http_proxy_exclusion_list",
-        "global_proxy_pac_url",
-    )
-
-    def __init__(
-        self,
-        device_serial: str = "",
-        shell: Callable[[list[str], str], str] | None = None,
-    ) -> None:
-        """Use an injectable shell boundary so lifecycle behavior is deterministic in tests."""
-        super().__init__("android", device_serial)
-        self._shell = shell or _android_adb_shell
-
-    def snapshot(self) -> ProxySnapshot:
-        """Read Android proxy keys and current SSID into an immutable snapshot."""
-        values = {key: self._get(key) for key in self._KEYS}
-        host, port = _proxy_host_port(values)
-        auto_config_url = _clean_setting(values.get("global_proxy_pac_url"))
-        mode = "auto" if auto_config_url else ("manual" if host and port else "none")
-        ssid_output = self._shell(["dumpsys", "wifi"], self.device_serial)
-        return ProxySnapshot(
-            target=self.target,
-            device_serial=self.device_serial,
-            ssid=_android_ssid(ssid_output),
-            mode=mode,
-            host=host,
-            port=port,
-            auto_config_url=auto_config_url,
-            exclusion_list=_clean_setting(values.get("global_http_proxy_exclusion_list")),
-            raw=values,
-        )
-
-    def apply(self, host: str, port: int) -> dict[str, Any]:
-        """Write all Android proxy keys to the lease host and port."""
-        if not host or int(port) <= 0:
-            raise ValueError("Android 代理 host 和 port 必须有效")
-        self._put("http_proxy", f"{host}:{int(port)}")
-        self._put("global_http_proxy_host", host)
-        self._put("global_http_proxy_port", str(int(port)))
-        self._put("global_http_proxy_exclusion_list", "")
-        self._delete("global_proxy_pac_url")
-        return {"ok": True, "target": self.target, "host": host, "port": int(port)}
-
-    def verify(self, host: str, port: int) -> dict[str, Any]:
-        """Verify Android's effective proxy matches the managed lease."""
-        current = self.snapshot()
-        ok = current.mode == "manual" and current.host == host and current.port == int(port)
-        return {"ok": ok, "expected": {"host": host, "port": int(port)}, "actual": asdict(current)}
-
-    def restore(self, snapshot: ProxySnapshot) -> dict[str, Any]:
-        """Restore every captured Android proxy key, including an originally disabled proxy."""
-        raw = snapshot.raw or {}
-        for key in self._KEYS:
-            value = _clean_setting(raw.get(key))
-            if value:
-                self._put(key, value)
-            else:
-                self._delete(key)
-        if snapshot.mode == "none":
-            # Android uses :0 as the explicit disabled value; write it last to prevent stale host/port reuse.
-            self._put("http_proxy", ":0")
-        return {"ok": True, "target": self.target, "restored": asdict(snapshot)}
-
-    def verify_restored(self, snapshot: ProxySnapshot) -> dict[str, Any]:
-        """Compare the normalized effective Android proxy with its original snapshot."""
-        current = self.snapshot()
-        ok = (
-            current.mode == snapshot.mode
-            and current.host == snapshot.host
-            and current.port == snapshot.port
-            and current.auto_config_url == snapshot.auto_config_url
-            and current.exclusion_list == snapshot.exclusion_list
-        )
-        return {"ok": ok, "expected": asdict(snapshot), "actual": asdict(current)}
-
-    def _get(self, key: str) -> str:
-        """Read one Android global setting without mutating device state."""
-        return str(self._shell(["settings", "get", "global", key], self.device_serial) or "").strip()
-
-    def _put(self, key: str, value: str) -> None:
-        """Write one Android global setting through the injected ADB boundary."""
-        self._shell(["settings", "put", "global", key, value], self.device_serial)
-
-    def _delete(self, key: str) -> None:
-        """Delete one Android global setting when it was absent in the snapshot."""
-        self._shell(["settings", "delete", "global", key], self.device_serial)
-
-
 class SemanticSettingsProxyAdapter(DeviceProxyAdapter):
-    """Manage iOS or HarmonyOS proxy state through a semantic device-driver contract."""
+    """Manage the current Wi-Fi proxy through a semantic device-driver contract."""
 
     def __init__(self, target: str, device_serial: str, driver: Any) -> None:
         """Bind a driver that can read and configure the current Wi-Fi proxy semantically."""
@@ -232,6 +135,14 @@ class SemanticSettingsProxyAdapter(DeviceProxyAdapter):
         if not result.get("ok", False):
             raise RuntimeError(str(result.get("message") or result.get("failure") or "系统代理设置失败"))
         return result
+
+
+class AndroidProxyAdapter(SemanticSettingsProxyAdapter):
+    """Manage only the connected Android Wi-Fi network through system Settings UI."""
+
+    def __init__(self, device_serial: str = "", driver: Any = None) -> None:
+        """Require a semantic driver so Android can never fall back to global proxy settings."""
+        super().__init__("android", device_serial, driver)
 
 
 class ManagedProxyLease:
@@ -378,7 +289,7 @@ def build_device_proxy_adapter(target: str, device_serial: str, driver: Any = No
     """Build the safe platform adapter without accepting any device/client IP mapping."""
     normalized = target.lower()
     if normalized == "android":
-        return AndroidProxyAdapter(device_serial)
+        return AndroidProxyAdapter(device_serial, driver)
     if normalized in {"ios", "harmony"}:
         return SemanticSettingsProxyAdapter(normalized, device_serial, driver)
     raise ValueError(f"不支持的代理目标端: {target}")
@@ -394,40 +305,3 @@ def _lease_failure(stage: str, adapter: DeviceProxyAdapter, exc: Exception) -> d
         "message": str(exc),
         "error_type": exc.__class__.__name__,
     }
-
-
-def _android_adb_shell(args: list[str], device_serial: str = "") -> str:
-    """Execute one bounded ADB shell command for the selected device."""
-    command = ["adb"] + (["-s", device_serial] if device_serial else []) + ["shell", *args]
-    completed = subprocess.run(command, text=True, capture_output=True, timeout=8)
-    if completed.returncode != 0:
-        raise RuntimeError((completed.stderr or completed.stdout or "ADB command failed").strip())
-    return (completed.stdout or "").strip()
-
-
-def _clean_setting(value: Any) -> str:
-    """Normalize Android's null-like settings output into an absent value."""
-    text = str(value or "").strip()
-    return "" if text.lower() in {"null", "none", "undefined"} else text
-
-
-def _proxy_host_port(values: dict[str, Any]) -> tuple[str, int]:
-    """Resolve Android proxy host and port from combined or split global settings."""
-    combined = _clean_setting(values.get("http_proxy"))
-    host = _clean_setting(values.get("global_http_proxy_host"))
-    port_text = _clean_setting(values.get("global_http_proxy_port"))
-    if combined and combined not in {":0", "0"} and ":" in combined:
-        combined_host, combined_port = combined.rsplit(":", 1)
-        host = combined_host or host
-        port_text = combined_port or port_text
-    try:
-        port = int(port_text or 0)
-    except ValueError:
-        port = 0
-    return (host if port > 0 else "", port if host and port > 0 else 0)
-
-
-def _android_ssid(dumpsys_wifi: str) -> str:
-    """Extract the current Android SSID when dumpsys exposes it, without requiring it for safety."""
-    match = re.search(r'(?:SSID|ssid)[:=]\s*"?([^,"\n]+)', str(dumpsys_wifi or ""))
-    return match.group(1).strip() if match else ""

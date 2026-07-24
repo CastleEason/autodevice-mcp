@@ -23,6 +23,15 @@ class WDAConnectionError(RuntimeError):
     """Raised when WebDriverAgent cannot be reached or returns an error."""
 
 
+class WDAReadinessError(WDAConnectionError):
+    """Describe the exact WDA readiness stage that blocked iOS automation."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        """Attach a stable stage so preflight can return actionable trust diagnostics."""
+        super().__init__(message)
+        self.stage = stage
+
+
 class WDARequestTimeoutError(WDAConnectionError):
     """Raised when a WDA HTTP request times out before returning a response."""
 
@@ -48,6 +57,99 @@ class IOSWDAClient:
     def status(self) -> dict[str, Any]:
         """Return the current backend readiness status."""
         return self._request("GET", "/status")
+
+    def verify_readiness(self) -> dict[str, Any]:
+        """Prove WDA status, session creation, and a read-only XCTest command before automation."""
+        try:
+            status = self.status()
+        except WDAConnectionError as exc:
+            raise WDAReadinessError("transport", f"WDA /status 不可用：{exc}") from exc
+
+        value = _wda_value(status)
+        status_value = value if isinstance(value, dict) else {}
+        ready = status_value.get("ready")
+        state = str(status_value.get("state") or "").lower()
+        legacy_status = status.get("status") if isinstance(status, dict) else None
+        if ready is False:
+            message = str(status_value.get("message") or "WebDriverAgent 未准备好")
+            raise WDAReadinessError(
+                "status",
+                f"WDA /status 返回 ready=false：{message}。请确认真机开发者模式和开发者 App 信任已通过。",
+            )
+        status_ready = ready is True or state == "success" or legacy_status == 0
+        if not status_ready:
+            raise WDAReadinessError(
+                "status",
+                "WDA /status 未返回 ready=true 或 success，不能进入后续设备流程。",
+            )
+
+        existing_session = str(
+            (status.get("sessionId") if isinstance(status, dict) else "")
+            or status_value.get("sessionId")
+            or self.session_id
+            or ""
+        )
+        previous_session = self.session_id
+        temporary_session = False
+        if existing_session:
+            self.session_id = existing_session
+        else:
+            try:
+                self._create_session()
+                temporary_session = True
+            except WDAConnectionError as exc:
+                raise WDAReadinessError(
+                    "session",
+                    f"WDA /status 可访问，但 session 创建失败：{exc}。请确认真机已信任开发者并保持 WDA Runner 前台可执行。",
+                ) from exc
+
+        probed_session = self.session_id
+        try:
+            width, height = self.window_size()
+        except WDAConnectionError as exc:
+            self._cleanup_readiness_session(temporary_session, previous_session)
+            raise WDAReadinessError(
+                "command",
+                f"WDA session 已建立，但基础只读动作 window size 失败：{exc}。",
+            ) from exc
+        if width <= 0 or height <= 0:
+            self._cleanup_readiness_session(temporary_session, previous_session)
+            raise WDAReadinessError(
+                "command",
+                f"WDA window size 返回无效尺寸 {width}x{height}，禁止进入后续设备流程。",
+            )
+
+        deleted = self._cleanup_readiness_session(temporary_session, previous_session)
+        return {
+            "ok": True,
+            "stage": "ready",
+            "checks": {
+                "status_ready": True,
+                "status": status,
+                "session": {
+                    "session_id": probed_session,
+                    "temporary": temporary_session,
+                },
+                "window_size": {"width": width, "height": height},
+                "temporary_session_deleted": deleted,
+            },
+        }
+
+    def _cleanup_readiness_session(self, temporary: bool, previous_session: str) -> bool:
+        """Delete only a probe-created session and restore the caller's prior session identity."""
+        if not temporary:
+            return False
+        probe_session = self.session_id
+        try:
+            self._request("DELETE", f"/session/{probe_session}")
+        except WDAConnectionError as exc:
+            self.session_id = previous_session
+            raise WDAReadinessError(
+                "session_cleanup",
+                f"WDA 临时 readiness session 清理失败：{exc}",
+            ) from exc
+        self.session_id = previous_session
+        return True
 
     def launch_app(self, bundle_id: str) -> dict[str, Any]:
         """Launch the requested application package or bundle."""
@@ -382,3 +484,26 @@ def _validated_wda_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("WDA URL 必须是包含主机名的 http:// 或 https:// 地址")
     return normalized
+
+
+def probe_wda_readiness(
+    wda_url: str = "",
+    *,
+    timeout: float = 6,
+    device_udid: str = "",
+) -> dict[str, Any]:
+    """Return structured strong-readiness evidence for preflight and WDA guardian."""
+    try:
+        return IOSWDAClient(wda_url, timeout=timeout, device_udid=device_udid).verify_readiness()
+    except WDAReadinessError as exc:
+        return {"ok": False, "stage": exc.stage, "error": str(exc)}
+    except WDAConnectionError as exc:
+        return {"ok": False, "stage": "transport", "error": str(exc)}
+
+
+def probe_wda_transport(wda_url: str = "", *, timeout: float = 6) -> dict[str, Any]:
+    """Check only the WDA HTTP transport for keepalive loops that must not churn sessions."""
+    try:
+        return {"ok": True, "stage": "transport", "status": IOSWDAClient(wda_url, timeout=timeout).status()}
+    except WDAConnectionError as exc:
+        return {"ok": False, "stage": "transport", "error": str(exc)}

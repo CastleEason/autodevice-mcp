@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from mobile_auto_mcp.proxy.device_proxy import ProxySnapshot, SemanticSettingsProxyAdapter
+from mobile_auto_mcp.proxy.device_proxy import (
+    ProxySnapshot,
+    SemanticSettingsProxyAdapter,
+    build_device_proxy_adapter,
+)
 
 
 class _FakeDriver:
@@ -43,3 +47,28 @@ def test_semantic_snapshot_requires_an_identified_ssid() -> None:
 
     with pytest.raises(RuntimeError, match="SSID"):
         adapter.snapshot()
+
+
+def test_android_proxy_uses_current_wifi_semantic_driver_instead_of_global_settings() -> None:
+    """验证 Android 与其他端一致地修改当前 Wi-Fi，不再写系统全局 HTTP 代理。"""
+    driver = _FakeDriver("qa-wifi")
+    adapter = build_device_proxy_adapter("android", "android-device", driver)
+
+    applied = adapter.apply("192.168.1.20", 13000)
+
+    assert isinstance(adapter, SemanticSettingsProxyAdapter)
+    assert applied["ok"] is True
+    assert driver.configurations == [
+        {
+            "mode": "manual",
+            "host": "192.168.1.20",
+            "port": 13000,
+            "auto_config_url": "",
+        }
+    ]
+
+
+def test_android_proxy_refuses_to_fall_back_when_semantic_driver_is_missing() -> None:
+    """验证缺少系统设置驱动时直接阻断，不能静默降级到 settings put global。"""
+    with pytest.raises(ValueError, match="DeviceDriver"):
+        build_device_proxy_adapter("android", "android-device")
